@@ -1,0 +1,24 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  playwright-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Bağımlılıkları kur
+        run: npm install
+
+      - name: Playwright Chromium'u kur
+        run: npx playwright install --with-deps chromium
+
+      - name: Derle ve tüm regresyon testlerini çalıştır
+        run: npm test

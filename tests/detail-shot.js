@@ -1,0 +1,60 @@
+const { chromium } = require('playwright');
+const path = require('path');
+const fs = require('fs');
+const OUT_DIR = path.resolve(__dirname, '../screenshots');
+fs.mkdirSync(OUT_DIR, { recursive: true });
+(async () => {
+  const browser = await chromium.launch({ args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_CHROMIUM_PATH ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH } : {}) });
+  for (const scheme of ['light','dark']) {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, colorScheme: scheme });
+    await page.route('**://fonts.g*/**', route => route.abort());
+    await page.goto('file://' + path.resolve(__dirname, '../dist/final.html'));
+    await page.waitForTimeout(150);
+    await page.click('[data-action="tab"][data-tab="hesaplar"]');
+    await page.click('button:has-text("Hesap Ekle")');
+    await page.fill('#modal-first-input', 'Ziraat Vadesiz');
+    await page.fill('input[name="opening"]', '5000');
+    await page.click('form[data-action="save-account"] button[type=submit]');
+    await page.waitForTimeout(150);
+    await page.click('button:has-text("Hesap Ekle")');
+    await page.click('[data-action="acc-type"][data-val="card"]');
+    await page.fill('#modal-first-input', 'Bonus Kart');
+    await page.fill('input[name="opening"]', '3400');
+    await page.fill('input[name="limit"]', '10000');
+    await page.click('form[data-action="save-account"] button[type=submit]');
+    await page.waitForTimeout(150);
+    // hesaplar sekmesi (4'lü seg + Nakit grubu görünsün)
+    await page.click('button:has-text("Hesap Ekle")');
+    await page.waitForTimeout(100);
+    await page.screenshot({ path: path.join(OUT_DIR, `seg4_${scheme}.png`) });
+    await page.click('[data-action="close-modal"]');
+    // Ziraat detayına gir, bir kaç hareket ekle
+    await page.click('[data-action="tab"][data-tab="ozet"]');
+    await page.click('.fab');
+    await page.fill('#modal-first-input', '250');
+    await page.click('[data-action="tx-cat"]');
+    await page.selectOption('select[name="accountId"]', { label: 'Ziraat Vadesiz (Banka Hesabı)' });
+    await page.click('form[data-action="save-tx"] button[type=submit]');
+    await page.waitForTimeout(150);
+    await page.click('[data-action="tab"][data-tab="hesaplar"]');
+    await page.locator('.acct-card', { hasText: 'Bonus Kart' }).locator('[data-action="pay-card"]').click();
+    await page.waitForTimeout(100);
+    await page.fill('#modal-first-input', '600');
+    await page.selectOption('select[name="accountId"]', { label: 'Ziraat Vadesiz (Banka Hesabı)' });
+    await page.click('form[data-action="save-tx"] button[type=submit]');
+    await page.waitForTimeout(150);
+    await page.locator('.acct-card', { hasText: 'Ziraat Vadesiz' }).locator('.acct-clickable').click();
+    await page.waitForTimeout(150);
+    await page.screenshot({ path: path.join(OUT_DIR, `detail_bank_${scheme}.png`) });
+    await page.click('[data-action="close-modal"]');
+    await page.locator('.acct-card', { hasText: 'Bonus Kart' }).locator('.acct-clickable').click();
+    await page.waitForTimeout(150);
+    await page.screenshot({ path: path.join(OUT_DIR, `detail_card_${scheme}.png`) });
+    await page.click('[data-action="close-modal"]');
+    await page.locator('.acct-card', { hasText: 'Bonus Kart' }).locator('[data-action="pay-card"]').click();
+    await page.waitForTimeout(100);
+    await page.screenshot({ path: path.join(OUT_DIR, `paycard_${scheme}.png`) });
+    await page.close();
+  }
+  await browser.close();
+})();

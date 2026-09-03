@@ -1,0 +1,63 @@
+rules_version = '2';
+
+/*
+ * Yılmaz Hane Defteri — Firestore güvenlik kuralları.
+ *
+ * Bu dosyanın içeriğini Firebase Console'da Firestore Database > Rules
+ * sekmesine yapıştırıp "Publish" ile yayınlayın (bkz. proje kurulum
+ * kılavuzu). Claude bu kuralları otomatik yayınlayamaz çünkü bunun için
+ * kullanıcının kendi Firebase hesabıyla onaylaması gerekir.
+ *
+ * Veri modeli:
+ *  - households/{hid}: { ownerUid, members: [uid,...], memberProfiles: {uid: {...}}, state: {...} }
+ *    Sadece members listesindeki kullanıcılar okuyup yazabilir.
+ *  - users/{uid}: { householdId, email, name } — bir kullanıcının hangi
+ *    household'a ait olduğunu hızlıca bulmak için. Sadece sahibi okuyup yazabilir.
+ *  - invites/{email}: { householdId, invitedByUid, invitedByName, createdAt }
+ *    Bir household üyesi tarafından oluşturulur; ilgili e-postayla giriş
+ *    yapan kişi kendi daveti olup olmadığını (id = kendi e-postası) okuyup
+ *    katıldıktan sonra siler.
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    match /users/{uid} {
+      allow read, write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    match /invites/{email} {
+      // household üyesi yeni bir davet oluşturabilir/günceller
+      allow create, update: if isSignedIn()
+        && exists(/databases/$(database)/documents/households/$(request.resource.data.householdId))
+        && request.auth.uid in get(/databases/$(database)/documents/households/$(request.resource.data.householdId)).data.members;
+      // davet edilen kişi kendi e-postasına ait daveti okuyup (katıldıktan sonra) silebilir
+      allow read, delete: if isSignedIn() && myEmail() == email;
+    }
+
+    match /households/{hid} {
+      // zaten üye olan biri kendi household'unu okuyup güncelleyebilir
+      allow read, update: if isSignedIn() && request.auth.uid in resource.data.members;
+      // yeni household: sadece kendini tek üye olarak yazan kişi oluşturabilir
+      allow create: if isSignedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.members == [request.auth.uid];
+      // davet kabul akışı: geçerli bir davete sahip kişi kendi uid'sini
+      // members listesine ekleyebilir (başka hiçbir alanı değiştiremez,
+      // members'a sadece kendi uid'sini ekleyebilir)
+      allow update: if isSignedIn()
+        && !(request.auth.uid in resource.data.members)
+        && exists(/databases/$(database)/documents/invites/$(myEmail()))
+        && get(/databases/$(database)/documents/invites/$(myEmail())).data.householdId == hid
+        && request.resource.data.members == resource.data.members.concat([request.auth.uid])
+        && request.resource.data.state == resource.data.state
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+    }
+  }
+}

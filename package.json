@@ -1,0 +1,16 @@
+{
+  "name": "yilmaz-hane-defteri",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Yılmaz ailesi için paylaşımlı ev muhasebesi uygulaması. İki barındırma yolu destekler: Claude Artifact (dist/) ve bağımsız barındırma — Firebase Auth + Firestore, GitHub Pages üzerinden docs/index.html olarak yayınlanır.",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "build:publish": "node scripts/build-publish.js",
+    "build:standalone": "node scripts/build-standalone.js",
+    "test": "node scripts/run-tests.js",
+    "screenshot": "node scripts/build.js && node tests/screenshot.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.47.0"
+  }
+}

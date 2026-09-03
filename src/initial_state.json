@@ -1,0 +1,33 @@
+{
+  "v": 1,
+  "people": [
+    { "id": "p_ergin", "name": "Ergin", "approved": true, "isAdmin": true },
+    { "id": "p_es", "name": "Eş", "approved": true, "isAdmin": false }
+  ],
+  "categories": {
+    "expense": [
+      { "id": "ce1", "name": "Market / Gıda", "slot": 0 },
+      { "id": "ce2", "name": "Faturalar", "slot": 1 },
+      { "id": "ce3", "name": "Kira / Aidat", "slot": 2 },
+      { "id": "ce4", "name": "Ulaşım", "slot": 3 },
+      { "id": "ce5", "name": "Sağlık", "slot": 4 },
+      { "id": "ce6", "name": "Giyim", "slot": 5 },
+      { "id": "ce7", "name": "Eğlence / Sosyal", "slot": 6 },
+      { "id": "ce8", "name": "Diğer Gider", "slot": 7 }
+    ],
+    "income": [
+      { "id": "ci1", "name": "Maaş", "slot": 0 },
+      { "id": "ci2", "name": "Ek Gelir", "slot": 2 },
+      { "id": "ci3", "name": "Yatırım Geliri", "slot": 5 },
+      { "id": "ci4", "name": "Diğer Gelir", "slot": 7 }
+    ]
+  },
+  "accounts": [
+    { "id": "acc_nakit", "type": "cash", "name": "Nakit", "opening": 0 }
+  ],
+  "transactions": [],
+  "budgets": {},
+  "recurring": [],
+  "goals": [],
+  "templates": []
+}
