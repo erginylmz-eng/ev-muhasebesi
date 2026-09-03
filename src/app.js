@@ -37,7 +37,8 @@
     camera: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8a2 2 0 012-2h1.2l1-1.6A1 1 0 019 4h6a1 1 0 01.8.4L17 6h1a2 2 0 012 2v10a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><circle cx="12" cy="13" r="3.6"/></svg>',
     star: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.6 5.6 6.1.6-4.6 4.1 1.3 6-5.4-3.2-5.4 3.2 1.3-6-4.6-4.1 6.1-.6z"/></svg>',
     upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M6 9l6-6 6 6"/><path d="M4 20h16"/></svg>',
-    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="M6 12l6 6 6-6"/><path d="M4 20h16"/></svg>'
+    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="M6 12l6 6 6-6"/><path d="M4 20h16"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>'
   };
   function icon(name, extraClass){ return '<span class="icon' + (extraClass ? ' ' + extraClass : '') + '" aria-hidden="true">' + (ICONS[name]||'') + '</span>'; }
 
@@ -45,6 +46,54 @@
   function uid(prefix){ return (prefix||'id') + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
   function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
+
+  /* ---------------- Şifre Kasası: uçtan uca şifreleme yardımcıları ----------------
+     Ana şifre hiçbir zaman kaydedilmez/gönderilmez/persist edilmez; yalnızca
+     tarayıcı belleğinde (vaultKey, bir CryptoKey nesnesi) tutulur ve sayfa
+     yenilendiğinde/kilitlendiğinde kaybolur — yeniden kilit açma gerekir.
+     PBKDF2 (SHA-256, 210.000 iterasyon, OWASP 2023 önerisi) ile ana şifreden
+     bir AES-GCM anahtarı türetilir; her kayıt kendi rastgele IV'siyle ayrı ayrı
+     şifrelenir. Firestore'a veya git'e ASLA düz metin şifre gitmez. */
+  function b64FromBytes(bytes){
+    var bin = '';
+    for(var i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  function bytesFromB64(b64){
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for(var i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  function randomB64(len){ return b64FromBytes(crypto.getRandomValues(new Uint8Array(len))); }
+  var VAULT_CHECK_PLAINTEXT = 'hane-defteri-vault-ok-v1';
+  function vaultDeriveKey(password, saltB64){
+    var enc = new TextEncoder();
+    return crypto.subtle.importKey('raw', enc.encode(password), {name:'PBKDF2'}, false, ['deriveKey']).then(function(baseKey){
+      return crypto.subtle.deriveKey(
+        { name:'PBKDF2', salt: bytesFromB64(saltB64), iterations: 210000, hash:'SHA-256' },
+        baseKey,
+        { name:'AES-GCM', length:256 },
+        false,
+        ['encrypt','decrypt']
+      );
+    });
+  }
+  function vaultEncryptText(key, plaintext){
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var enc = new TextEncoder();
+    return crypto.subtle.encrypt({name:'AES-GCM', iv:iv}, key, enc.encode(plaintext)).then(function(cipherBuf){
+      return { iv: b64FromBytes(iv), cipher: b64FromBytes(new Uint8Array(cipherBuf)) };
+    });
+  }
+  function vaultDecryptText(key, ivB64, cipherB64){
+    var dec = new TextDecoder();
+    return crypto.subtle.decrypt({name:'AES-GCM', iv: bytesFromB64(ivB64)}, key, bytesFromB64(cipherB64)).then(function(plainBuf){
+      return dec.decode(plainBuf);
+    });
+  }
+  /* CryptoKey — yalnızca bellekte, asla state içine veya persist()'e girmez. */
+  var vaultKey = null;
   /* ---------------- döviz cinsleri ---------------- */
   var CURRENCIES = [ ['TRY','Türk Lirası','₺'], ['USD','Dolar','$'], ['EUR','Euro','€'], ['ALTIN','Altın','gr'] ];
   var CURRENCY_MAP = {};
@@ -270,6 +319,7 @@
       templates: [],
       fxRates: { USD: null, EUR: null, ALTIN: null },
       auditLog: [],
+      passwordVault: { salt: null, check: null, entries: [] },
       cardNetworks: [
         { id:'net_bonus', name:'Bonus' },
         { id:'net_axess', name:'Axess' },
@@ -288,6 +338,8 @@
     if(!s.fxRates) s.fxRates = { USD: null, EUR: null, ALTIN: null };
     else ['USD','EUR','ALTIN'].forEach(function(code){ if(s.fxRates[code]===undefined) s.fxRates[code] = null; });
     if(!s.auditLog) s.auditLog = [];
+    if(!s.passwordVault) s.passwordVault = { salt: null, check: null, entries: [] };
+    else if(!s.passwordVault.entries) s.passwordVault.entries = [];
     if(!s.cardNetworks || !s.cardNetworks.length){
       s.cardNetworks = [
         { id:'net_bonus', name:'Bonus' },
@@ -430,7 +482,9 @@
     toast: null,
     txNoteSuggestion: null,
     bulkImport: null,  // { text, step:'input'|'preview', rows:[...] }
-    loanImport: null   // { text, step:'input'|'preview', rows:[...] } — kredi amortisman tablosu içe aktarma (Hesap Ekle/Düzenle formunun içinde)
+    loanImport: null,  // { text, step:'input'|'preview', rows:[...] } — kredi amortisman tablosu içe aktarma (Hesap Ekle/Düzenle formunun içinde)
+    vaultUnlockError: null,
+    vaultReveal: {}    // { entryId: {username,password,notes} } — geçici olarak çözülmüş kayıtlar, yalnızca bellekte
   };
   try{
     var savedTab = sessionStorage.getItem('hd_tab');
@@ -1275,7 +1329,7 @@
   }
 
   function renderTopbar(){
-    var titles = { ozet:'Özet', hareketler:'Hareketler', hesaplar:'Hesaplar', raporlar:'Raporlar', ayarlar:'Ayarlar' };
+    var titles = { ozet:'Özet', hareketler:'Hareketler', hesaplar:'Hesaplar', raporlar:'Raporlar', sifreler:'Şifreler', ayarlar:'Ayarlar' };
     return '<div class="topbar">' +
       '<div class="brand">Hane Defteri<small>' + esc(titles[ui.tab]||'') + '</small></div>' +
       (ui.readOnly ? '<span class="readonly-chip">Salt okunur</span>' : '') +
@@ -1294,6 +1348,7 @@
       {id:'hareketler', label:'Hareketler', icon:'list'},
       {id:'hesaplar', label:'Hesaplar', icon:'wallet'},
       {id:'raporlar', label:'Raporlar', icon:'chart'},
+      {id:'sifreler', label:'Şifreler', icon:'lock'},
       {id:'ayarlar', label:'Ayarlar', icon:'settings'}
     ];
     var items = tabs.map(function(t){
@@ -1307,6 +1362,7 @@
     if(ui.tab==='hareketler') return renderHareketler();
     if(ui.tab==='hesaplar') return renderHesaplar();
     if(ui.tab==='raporlar') return renderRaporlar();
+    if(ui.tab==='sifreler') return renderSifreler();
     if(ui.tab==='ayarlar') return renderAyarlar();
     return renderOzet();
   }
@@ -2147,6 +2203,92 @@
     return html;
   }
 
+  /* ---------------- ŞİFRELER (Şifre Kasası) ----------------
+     state.passwordVault = { salt, check:{iv,cipher}, entries:[{id,bank,iv,cipher,updatedAt}] }.
+     Her entry'nin cipher'ı {username,password,notes} JSON'unun AES-GCM ile
+     şifrelenmiş hâlidir. Ana şifre ve ondan türetilen anahtar (vaultKey)
+     ASLA state'e/persist'e girmez — yalnızca bu sekme dolaşırken bellekte
+     durur, sayfa yenilenince veya "Kilitle" denince kaybolur. */
+  function renderSifreler(){
+    var v = state.passwordVault || { salt:null, check:null, entries:[] };
+    var html = '';
+    if(!v.salt){
+      html += '<div class="card">';
+      html += '<h2 style="margin-bottom:6px">Şifre Kasası</h2>';
+      html += '<p class="mute2">Banka ve site şifrelerinizi burada saklayabilirsiniz. Önce bir <b>ana şifre</b> belirleyin — bu, Google hesabınızdan tamamen bağımsızdır. Tüm şifreleriniz bu ana şifreyle cihazınızda şifrelenip öyle kaydedilir; sunucuya/veritabanına asla düz metin gitmez. <b>Ana şifreyi unutursanız kayıtlı şifrelere bir daha ulaşılamaz</b> — bir yere güvenle not edin.</p>';
+      html += '<form data-action="vault-setup" style="margin-top:10px;display:flex;flex-direction:column;gap:8px">' +
+        '<div class="field"><label>Ana Şifre</label><input id="modal-first-input" type="password" name="password" minlength="6" required autocomplete="new-password"></div>' +
+        '<div class="field"><label>Ana Şifre (Tekrar)</label><input type="password" name="password2" minlength="6" required autocomplete="new-password"></div>' +
+        '<button type="submit" class="btn btn-primary">Kasayı Oluştur</button>' +
+        '</form>';
+      html += '</div>';
+      return html;
+    }
+    if(!vaultKey){
+      html += '<div class="card">';
+      html += '<h2 style="margin-bottom:6px">Şifre Kasası Kilitli</h2>';
+      html += '<p class="mute2">Devam etmek için ana şifrenizi girin.</p>';
+      if(ui.vaultUnlockError) html += '<p class="mute2" style="color:var(--critical)">' + esc(ui.vaultUnlockError) + '</p>';
+      html += '<form data-action="vault-unlock" style="margin-top:10px;display:flex;flex-direction:column;gap:8px">' +
+        '<div class="field"><label>Ana Şifre</label><input id="modal-first-input" type="password" name="password" required autocomplete="current-password"></div>' +
+        '<button type="submit" class="btn btn-primary">Kilidi Aç</button>' +
+        '</form>';
+      html += '<button class="btn btn-ghost btn-sm" style="margin-top:10px" data-action="vault-forgot">Ana şifremi unuttum</button>';
+      html += '</div>';
+      return html;
+    }
+    html += '<div class="row" style="margin-bottom:10px"><h2>Şifreleriniz</h2>' +
+      '<button class="btn btn-ghost btn-sm" data-action="vault-lock">Kilitle</button></div>';
+    var entries = (v.entries||[]).slice().sort(function(a,b){ return (a.bank||'').localeCompare(b.bank||'','tr'); });
+    if(!entries.length){
+      html += '<div class="empty-state"><p class="mute2">Henüz kayıtlı şifreniz yok.</p></div>';
+    } else {
+      html += '<div class="card" style="padding:0">';
+      entries.forEach(function(entry){
+        var revealed = ui.vaultReveal[entry.id];
+        html += '<div class="row" style="padding:12px 14px;border-bottom:1px solid var(--border)">';
+        html += '<div class="stack">';
+        html += '<span style="font-weight:600">' + esc(entry.bank) + '</span>';
+        if(revealed){
+          if(revealed.username) html += '<span class="mute2">Kullanıcı: ' + esc(revealed.username) + '</span>';
+          html += '<span class="mute2" style="font-family:&quot;IBM Plex Mono&quot;,monospace">' + esc(revealed.password) + '</span>';
+          if(revealed.notes) html += '<span class="mute2">' + esc(revealed.notes) + '</span>';
+        } else {
+          html += '<span class="mute2" style="font-family:&quot;IBM Plex Mono&quot;,monospace">••••••••</span>';
+        }
+        html += '</div>';
+        html += '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">';
+        html += '<button class="btn btn-ghost btn-sm" data-action="vault-toggle-reveal" data-id="' + entry.id + '">' + (revealed?'Gizle':'Göster') + '</button>';
+        if(revealed) html += '<button class="btn btn-ghost btn-sm" data-action="vault-copy" data-id="' + entry.id + '">Kopyala</button>';
+        html += '<button class="btn btn-ghost btn-sm" data-action="vault-edit" data-id="' + entry.id + '" aria-label="Düzenle">' + icon('edit') + '</button>';
+        html += '<button class="btn btn-ghost btn-sm" data-action="vault-delete" data-id="' + entry.id + '" aria-label="Sil">' + icon('trash') + '</button>';
+        html += '</div></div>';
+      });
+      html += '</div>';
+    }
+    html += '<button class="btn btn-primary" style="margin-top:14px;width:100%" data-action="vault-add">' + icon('plus') + ' Yeni Şifre Ekle</button>';
+    return html;
+  }
+
+  function renderVaultEntryForm(){
+    var d = ui.modalData || {};
+    var editing = !!d.id;
+    var bankNames = [];
+    state.accounts.forEach(function(a){ if(a.bankName && bankNames.indexOf(a.bankName)===-1) bankNames.push(a.bankName); });
+    var datalist = '<datalist id="vault-bank-list">' + bankNames.map(function(n){ return '<option value="' + esc(n) + '">'; }).join('') + '</datalist>';
+    return '<div class="sheet-head"><h2>' + (editing ? 'Şifreyi Düzenle' : 'Yeni Şifre Ekle') + '</h2>' +
+      '<button class="btn btn-ghost" data-action="close-modal" aria-label="Kapat">' + icon('x') + '</button></div>' +
+      '<form data-action="vault-save">' +
+      (editing ? '<input type="hidden" name="id" value="' + esc(d.id) + '">' : '') +
+      '<div class="field"><label>Banka / Site Adı</label><input id="modal-first-input" type="text" name="bank" list="vault-bank-list" value="' + esc(d.bank||'') + '" required></div>' +
+      datalist +
+      '<div class="field"><label>Kullanıcı Adı (opsiyonel)</label><input type="text" name="username" value="' + esc(d.username||'') + '"></div>' +
+      '<div class="field"><label>Şifre</label><input type="text" name="password" value="' + esc(d.password||'') + '" required style="font-family:&quot;IBM Plex Mono&quot;,monospace"></div>' +
+      '<div class="field"><label>Not (opsiyonel)</label><textarea name="notes" rows="2">' + esc(d.notes||'') + '</textarea></div>' +
+      '<button type="submit" class="btn btn-primary btn-block">Kaydet</button>' +
+      '</form>';
+  }
+
   function renderAyarlar(){
     var html = '';
     var me = localIdentity ? getPerson(localIdentity) : null;
@@ -2550,6 +2692,7 @@
     else if(ui.modal==='setResetPin') inner = renderSetResetPinForm();
     else if(ui.modal==='resetConfirm') inner = renderResetConfirm();
     else if(ui.modal==='bulkImport') inner = renderBulkImportForm();
+    else if(ui.modal==='vaultEntry') inner = renderVaultEntryForm();
     return '<div class="sheet-overlay" data-action="overlay-close">' +
       '<div class="sheet" role="dialog" aria-modal="true">' + inner + '</div></div>';
   }
@@ -3572,6 +3715,56 @@
       render(); return;
     }
 
+    /* ---- Şifre Kasası ---- */
+    if(action==='vault-add'){ ui.modalData = {}; ui.modal = 'vaultEntry'; render(); return; }
+    if(action==='vault-edit'){
+      var veId = el.getAttribute('data-id');
+      var veEntry = (state.passwordVault.entries||[]).find(function(x){ return x.id===veId; });
+      if(!veEntry) return;
+      var veRevealed = ui.vaultReveal[veId];
+      if(veRevealed){
+        ui.modalData = { id: veId, bank: veEntry.bank, username: veRevealed.username, password: veRevealed.password, notes: veRevealed.notes };
+        ui.modal = 'vaultEntry'; render(); return;
+      }
+      vaultDecryptText(vaultKey, veEntry.iv, veEntry.cipher).then(function(json){
+        var payload = JSON.parse(json);
+        ui.modalData = { id: veId, bank: veEntry.bank, username: payload.username, password: payload.password, notes: payload.notes };
+        ui.modal = 'vaultEntry'; render();
+      }).catch(function(){ showToast('Şifre çözülemedi.'); });
+      return;
+    }
+    if(action==='vault-delete'){
+      var vdEntry = (state.passwordVault.entries||[]).find(function(x){ return x.id===el.getAttribute('data-id'); });
+      ui.modal = 'confirm';
+      ui.modalData = { title:'Şifreyi sil', message:'Bu kayıt (' + (vdEntry?vdEntry.bank:'') + ') kalıcı olarak silinecek.', onConfirm:{ kind:'vaultEntry', id: el.getAttribute('data-id') } };
+      render(); return;
+    }
+    if(action==='vault-toggle-reveal'){
+      var vtId = el.getAttribute('data-id');
+      if(ui.vaultReveal[vtId]){ delete ui.vaultReveal[vtId]; render(); return; }
+      var vtEntry = (state.passwordVault.entries||[]).find(function(x){ return x.id===vtId; });
+      if(!vtEntry) return;
+      vaultDecryptText(vaultKey, vtEntry.iv, vtEntry.cipher).then(function(json){
+        ui.vaultReveal[vtId] = JSON.parse(json);
+        render();
+      }).catch(function(){ showToast('Şifre çözülemedi — ana şifre değişmiş olabilir.'); });
+      return;
+    }
+    if(action==='vault-copy'){
+      var vcRevealed = ui.vaultReveal[el.getAttribute('data-id')];
+      if(!vcRevealed) return;
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(vcRevealed.password).then(function(){ showToast('Şifre kopyalandı.'); }).catch(function(){ showToast('Kopyalanamadı.'); });
+      }
+      return;
+    }
+    if(action==='vault-lock'){ vaultKey = null; ui.vaultReveal = {}; render(); return; }
+    if(action==='vault-forgot'){
+      ui.modal = 'confirm';
+      ui.modalData = { title:'Ana şifreyi sıfırla', message:'Ana şifrenizi unuttuysanız, kasadaki TÜM kayıtlı şifreler kurtarılamaz şekilde silinir ve yeni bir ana şifreyle sıfırdan başlarsınız. Bu işlem geri alınamaz.', onConfirm:{ kind:'vaultWipe' } };
+      render(); return;
+    }
+
     if(action==='confirm-yes'){
       var c = (ui.modalData && ui.modalData.onConfirm) || {};
       if(c.kind==='tx'){
@@ -3616,6 +3809,18 @@
         if(delGoal) logAudit('goal-delete', 'Hedef silindi: ' + delGoal.name);
       }
       else if(c.kind==='template'){ state.templates = state.templates.filter(function(x){ return x.id!==c.id; }); }
+      else if(c.kind==='vaultEntry'){
+        var delVaultEntry = (state.passwordVault.entries||[]).find(function(x){ return x.id===c.id; });
+        state.passwordVault.entries = (state.passwordVault.entries||[]).filter(function(x){ return x.id!==c.id; });
+        delete ui.vaultReveal[c.id];
+        if(delVaultEntry) logAudit('vault-delete', 'Şifre silindi: ' + delVaultEntry.bank);
+      }
+      else if(c.kind==='vaultWipe'){
+        state.passwordVault = { salt:null, check:null, entries:[] };
+        vaultKey = null;
+        ui.vaultReveal = {};
+        logAudit('vault-wipe', 'Şifre kasası sıfırlandı (ana şifre unutulmuştu)');
+      }
       else if(c.kind==='reset'){ state = defaultState(); logAudit('reset', 'Tüm veriler sıfırlandı'); }
       if(c.returnModal){ ui.modal = c.returnModal; ui.modalData = c.returnData; render(); }
       else { closeModal(); }
@@ -3926,6 +4131,62 @@
     if(action==='add-person'){
       var name = (fd.get('name')||'').trim();
       if(name){ state.people.push({ id: uid('p'), name: name, approved:true, isAdmin:false }); logAudit('person-add', name + ' eklendi'); form.reset(); persist(); }
+      return;
+    }
+
+    /* ---- Şifre Kasası ---- */
+    if(action==='vault-setup'){
+      var vsP1 = fd.get('password')||'', vsP2 = fd.get('password2')||'';
+      if(vsP1.length<6){ showToast('Ana şifre en az 6 karakter olmalı.'); return; }
+      if(vsP1!==vsP2){ showToast('Ana şifreler eşleşmiyor.'); return; }
+      var vsSalt = randomB64(16);
+      vaultDeriveKey(vsP1, vsSalt).then(function(key){
+        return vaultEncryptText(key, VAULT_CHECK_PLAINTEXT).then(function(chk){
+          state.passwordVault = { salt: vsSalt, check: chk, entries: [] };
+          vaultKey = key;
+          logAudit('vault-setup', 'Şifre kasası oluşturuldu');
+          form.reset();
+          persist();
+          showToast('Şifre kasası oluşturuldu.');
+        });
+      }).catch(function(){ showToast('Kasa oluşturulamadı, tekrar deneyin.'); });
+      return;
+    }
+    if(action==='vault-unlock'){
+      var vuP = fd.get('password')||'';
+      var vuVault = state.passwordVault;
+      vaultDeriveKey(vuP, vuVault.salt).then(function(key){
+        return vaultDecryptText(key, vuVault.check.iv, vuVault.check.cipher).then(function(plain){
+          if(plain !== VAULT_CHECK_PLAINTEXT) throw new Error('yanlış ana şifre');
+          vaultKey = key;
+          ui.vaultUnlockError = null;
+          form.reset();
+          render();
+        });
+      }).catch(function(){ ui.vaultUnlockError = 'Yanlış ana şifre.'; render(); });
+      return;
+    }
+    if(action==='vault-save'){
+      if(!vaultKey){ showToast('Kasa kilitli.'); return; }
+      var vSaveId = fd.get('id');
+      var vSaveBank = (fd.get('bank')||'').trim();
+      if(!vSaveBank){ showToast('Banka/site adı girin.'); return; }
+      var vSavePayload = JSON.stringify({ username: (fd.get('username')||'').trim(), password: fd.get('password')||'', notes: (fd.get('notes')||'').trim() });
+      vaultEncryptText(vaultKey, vSavePayload).then(function(enc){
+        if(!state.passwordVault.entries) state.passwordVault.entries = [];
+        if(vSaveId){
+          var existingEntry = state.passwordVault.entries.find(function(x){ return x.id===vSaveId; });
+          if(existingEntry){ existingEntry.bank = vSaveBank; existingEntry.iv = enc.iv; existingEntry.cipher = enc.cipher; existingEntry.updatedAt = new Date().toISOString(); }
+          delete ui.vaultReveal[vSaveId];
+          logAudit('vault-edit', 'Şifre güncellendi: ' + vSaveBank);
+        } else {
+          state.passwordVault.entries.push({ id: uid('pw'), bank: vSaveBank, iv: enc.iv, cipher: enc.cipher, updatedAt: new Date().toISOString() });
+          logAudit('vault-add', 'Yeni şifre eklendi: ' + vSaveBank);
+        }
+        closeModal();
+        persist();
+        showToast('Şifre kaydedildi.');
+      }).catch(function(){ showToast('Şifrelenemedi, tekrar deneyin.'); });
       return;
     }
 
