@@ -1,9 +1,9 @@
 {
   "usdTry": 48.315,
   "eurTry": 56.1177,
-  "onsAltinUsd": 4437.100098,
-  "gramAltinTry": 6892.42854145714,
-  "updatedAt": "2026-09-03T08:05:23.000Z",
+  "onsAltinUsd": 4469.299805,
+  "gramAltinTry": 6942.446385240603,
+  "updatedAt": "2026-09-04T06:35:14.240Z",
   "sources": {
     "fx": "https://api.frankfurter.dev (ECB referans kurları)",
     "gold": "https://api.gold-api.com (dünya spot ons altın, USD)"
