@@ -11,6 +11,11 @@ rules_version = '2';
  * Veri modeli:
  *  - households/{hid}: { ownerUid, members: [uid,...], memberProfiles: {uid: {...}}, state: {...} }
  *    Sadece members listesindeki kullanıcılar okuyup yazabilir.
+ *  - households/{hid}/backups/{YYYY-MM-DD}: { state: {...}, savedAt } — otomatik
+ *    periyodik yedekleme (madde: "Otomatik periyodik yedekleme"), her gün en
+ *    fazla bir kez uygulama tarafından otomatik yazılır/okunur/silinir (30
+ *    günden eski olanlar budanır). Sadece households/{hid}'nin kendi üyeleri
+ *    erişebilir — households/{hid} ile birebir aynı yetki kuralı.
  *  - users/{uid}: { householdId, email, name } — bir kullanıcının hangi
  *    household'a ait olduğunu hızlıca bulmak için. Sadece sahibi okuyup yazabilir.
  *  - invites/{email}: { householdId, invitedByUid, invitedByName, createdAt }
@@ -58,6 +63,13 @@ service cloud.firestore {
         && request.resource.data.members == resource.data.members.concat([request.auth.uid])
         && request.resource.data.state == resource.data.state
         && request.resource.data.ownerUid == resource.data.ownerUid;
+
+      match /backups/{backupId} {
+        // otomatik yedekler yalnızca ilgili household'un üyelerince okunup
+        // yazılabilir/silinebilir (households/{hid} ile aynı yetki).
+        allow read, write: if isSignedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/households/$(hid)).data.members;
+      }
     }
   }
 }

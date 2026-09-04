@@ -1,0 +1,39 @@
+name: Günlük Kur/Altın Güncellemesi
+
+# Finansal Bilgilendirme sayfası için USD/TRY, EUR/TRY ve gram altın verisini
+# her gün otomatik çeker ve docs/rates.json'u günceller. Tamamen GitHub
+# Actions üzerinde (ücretsiz, sınırsız) çalışır — Claude'a veya herhangi bir
+# manuel işleme bağlı değildir. Kaynaklar ücretsiz/keysiz/limitsizdir (bkz.
+# scripts/fetch-rates.js).
+on:
+  schedule:
+    - cron: '0 5 * * *'   # her gün 05:00 UTC (TR saatiyle ~08:00)
+  workflow_dispatch: {}     # gerekirse Actions sekmesinden elle de tetiklenebilir
+
+permissions:
+  contents: write
+
+jobs:
+  update-rates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Kurları çek ve docs/rates.json'u güncelle
+        run: node scripts/fetch-rates.js
+
+      - name: Değişiklik varsa commit'le ve push'la
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/rates.json
+          if git diff --cached --quiet; then
+            echo "Değişiklik yok, commit atlanıyor."
+          else
+            git commit -m "Günlük kur/altın güncellemesi"
+            git push
+          fi

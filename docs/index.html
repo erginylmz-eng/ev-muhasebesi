@@ -422,7 +422,10 @@
     star: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.6 5.6 6.1.6-4.6 4.1 1.3 6-5.4-3.2-5.4 3.2 1.3-6-4.6-4.1 6.1-.6z"/></svg>',
     upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M6 9l6-6 6 6"/><path d="M4 20h16"/></svg>',
     download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="M6 12l6 6 6-6"/><path d="M4 20h16"/></svg>',
-    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>'
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>',
+    bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0112 0c0 4.5 1.5 6 2 7H4c.5-1 2-2.5 2-7z"/><path d="M10 20a2 2 0 004 0"/></svg>',
+    coin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.2a2.6 2.6 0 015-.4M9.5 14.8a2.6 2.6 0 005-.4"/><path d="M12 7v10"/></svg>',
+    insight: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v3"/><path d="M12 19v3"/><circle cx="12" cy="12" r="6"/><path d="M12 9v3l2 2"/></svg>'
   };
   function icon(name, extraClass){ return '<span class="icon' + (extraClass ? ' ' + extraClass : '') + '" aria-hidden="true">' + (ICONS[name]||'') + '</span>'; }
 
@@ -704,6 +707,7 @@
       fxRates: { USD: null, EUR: null, ALTIN: null },
       auditLog: [],
       passwordVault: { salt: null, check: null, entries: [] },
+      reminders: [],
       cardNetworks: [
         { id:'net_bonus', name:'Bonus' },
         { id:'net_axess', name:'Axess' },
@@ -724,6 +728,7 @@
     if(!s.auditLog) s.auditLog = [];
     if(!s.passwordVault) s.passwordVault = { salt: null, check: null, entries: [] };
     else if(!s.passwordVault.entries) s.passwordVault.entries = [];
+    if(!s.reminders) s.reminders = [];
     if(!s.cardNetworks || !s.cardNetworks.length){
       s.cardNetworks = [
         { id:'net_bonus', name:'Bonus' },
@@ -868,7 +873,12 @@
     bulkImport: null,  // { text, step:'input'|'preview', rows:[...] }
     loanImport: null,  // { text, step:'input'|'preview', rows:[...] } — kredi amortisman tablosu içe aktarma (Hesap Ekle/Düzenle formunun içinde)
     vaultUnlockError: null,
-    vaultReveal: {}    // { entryId: {username,password,notes} } — geçici olarak çözülmüş kayıtlar, yalnızca bellekte
+    vaultReveal: {},   // { entryId: {username,password,notes} } — geçici olarak çözülmüş kayıtlar, yalnızca bellekte
+    reminderForm: null, // { id, title, date, repeatYearly, note } — Ayarlar > Hatırlatıcılar formu
+    finRates: null,     // Finansal Bilgilendirme: docs/rates.json'dan çekilen { usdTry, eurTry, gramAltinTry, onsAltinUsd, updatedAt }
+    finRatesError: null,
+    finRatesLoading: false,
+    backupsList: null   // Ayarlar > Veri > Yedekler: [{id, savedAt}] — istenince Firestore'dan çekilir
   };
   try{
     var savedTab = sessionStorage.getItem('hd_tab');
@@ -1013,6 +1023,61 @@
       invitedByUid: fbUser.uid,
       invitedByName: fbUser.displayName || fbUser.email,
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+  }
+
+  /* ---------------- Otomatik periyodik yedekleme ----------------
+     Her başarılı kayıttan sonra çağrılır; günde en fazla bir kez (tarayıcı
+     tarih değiştiğinde) households/{id}/backups/{YYYY-MM-DD} dokümanına o
+     anki TAM state anlık görüntüsünü yazar — üzerine yazma yaparak aynı gün
+     içinde tek doküman kalır. Hiçbir dış servise/Claude'a bağımlı değildir,
+     tamamen istemci + Firestore üzerinde otomatik çalışır. 30 günden eski
+     yedekler arka planda sessizce budanır (depolama sınırsızca büyümesin diye). */
+  var _lastBackupDate = null;
+  function fbSaveDailyBackupIfNeeded(){
+    if(BACKEND!=='firebase' || !fbHouseholdRef || !state) return;
+    var today = todayISO();
+    if(_lastBackupDate === today) return;
+    _lastBackupDate = today;
+    fbHouseholdRef.collection('backups').doc(today).set({
+      state: state,
+      savedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }).then(function(){ fbPruneOldBackups(); }).catch(function(){ /* yedek başarısız olsa da ana kayıt zaten tamam; sessizce geç */ });
+  }
+  function fbPruneOldBackups(){
+    if(!fbHouseholdRef) return;
+    var cutoff = addDaysToDate(todayISO(), -30);
+    fbHouseholdRef.collection('backups').get().then(function(snap){
+      snap.forEach(function(doc){
+        if(doc.id < cutoff) doc.ref.delete().catch(function(){});
+      });
+    }).catch(function(){});
+  }
+  /* Ayarlar > Veri > Yedekler'de "Yedekleri Görüntüle"ye basınca çağrılır. */
+  function fbListBackups(){
+    if(!fbHouseholdRef) return;
+    ui.backupsList = 'loading';
+    render();
+    fbHouseholdRef.collection('backups').orderBy(firebase.firestore.FieldPath.documentId(), 'desc').limit(30).get().then(function(snap){
+      var list = [];
+      snap.forEach(function(doc){ list.push({ id: doc.id }); });
+      ui.backupsList = list;
+      render();
+    }).catch(function(err){
+      ui.backupsList = [];
+      showToast('Yedek listesi alınamadı: ' + (err && err.message ? err.message : 'bilinmeyen hata'));
+    });
+  }
+  function fbRestoreBackup(backupId){
+    if(!fbHouseholdRef) return;
+    fbHouseholdRef.collection('backups').doc(backupId).get().then(function(doc){
+      if(!doc.exists){ showToast('Yedek bulunamadı.'); return; }
+      state = migrateState(doc.data().state || defaultState());
+      logAudit('backup-restore', backupId + ' tarihli yedek geri yüklendi');
+      persist();
+      showToast(backupId + ' tarihli yedek geri yüklendi.');
+    }).catch(function(err){
+      showToast('Yedek geri yüklenemedi: ' + (err && err.message ? err.message : 'bilinmeyen hata'));
     });
   }
 
@@ -1386,16 +1451,130 @@
     var expRows = categoryBreakdown(monthKeyStr, 'expense');
     var spentByCategory = {};
     expRows.forEach(function(r){ spentByCategory[r.cat.id] = r.amount; });
+    /* Abonelikler (madde: "Abonelik paneli"): bu ay vadesi gelmiş ama henüz
+       kaydedilmemiş abonelik tutarları, ilgili kategorinin bütçesine "beklenen"
+       olarak ekleniyor — kullanıcı "Ekle"ye basmadan önce bile bütçe çubuğunda
+       görünsün diye. dueRecurring() zaten o ay için henüz oluşturulmamış olanları
+       döndürüyor, bu yüzden gerçek kayıt oluşunca çift sayılmıyor. */
+    var pendingSubByCategory = {};
+    var monthCur = monthKeyStr === currentMonthKey();
+    if(monthCur){
+      dueRecurring().forEach(function(r){
+        if(!r.isSubscription || r.type!=='expense') return;
+        pendingSubByCategory[r.categoryId] = (pendingSubByCategory[r.categoryId]||0) + r.amount;
+      });
+    }
     var out = [];
     state.categories.expense.forEach(function(c){
       var limit = state.budgets[c.id];
       if(!limit || limit<=0) return;
       var spent = spentByCategory[c.id] || 0;
-      var pct = limit>0 ? (spent/limit*100) : 0;
+      var pendingSub = pendingSubByCategory[c.id] || 0;
+      var pct = limit>0 ? ((spent+pendingSub)/limit*100) : 0;
       var level = pct>=100 ? 'over' : (pct>=80 ? 'warn' : 'ok');
-      out.push({ cat:c, limit:limit, spent:spent, pct:pct, level:level });
+      out.push({ cat:c, limit:limit, spent:spent, pendingSub:pendingSub, pct:pct, level:level });
     });
     out.sort(function(a,b){ return b.pct-a.pct; });
+    return out;
+  }
+
+  /* ---------------- Abonelikler ("Abonelik paneli") ----------------
+     Bir düzenli ödeme (recurring), formundaki "Bu bir abonelik" kutusu
+     işaretlenerek abonelik sayılır (yalnızca gider tipi). Süresiz olduğu için
+     zaten cashFlowProjection()'daki indefiniteRecurringNet'e dahil olup gelecek
+     aylara yansıyor; budgetStatusForMonth() de bu ayki henüz eklenmemiş
+     tutarını ilgili kategori bütçesine "beklenen" olarak ekliyor. */
+  function activeSubscriptions(){
+    return state.recurring.filter(function(r){ return r.active && r.isSubscription && r.type==='expense'; })
+      .sort(function(a,b){ return b.amount-a.amount; });
+  }
+  function subscriptionsMonthlyTotal(){
+    return activeSubscriptions().reduce(function(s,r){ return s + r.amount; }, 0);
+  }
+
+  /* ---------------- Harcama alışkanlığı içgörüleri ----------------
+     Kural tabanlı (yapay zeka gerektirmeyen), mevcut Raporlar verisinden
+     türetilen basit tespitler: bu ayki kategori harcamalarını geçen ayla
+     karşılaştırır. Gürültüyü azaltmak için yalnızca anlamlı tutar (>=100 TL
+     fark) ve anlamlı oran (%|15| ve üzeri, ya da yeni bir kategori) değişimi
+     gösterilir; en büyük TL farkına sahip en fazla 4 içgörü döner. */
+  function spendingInsights(monthKeyStr){
+    var prevMk = addMonths(monthKeyStr, -1);
+    var curRows = categoryBreakdown(monthKeyStr, 'expense');
+    var prevRows = categoryBreakdown(prevMk, 'expense');
+    var prevByCat = {};
+    prevRows.forEach(function(r){ prevByCat[r.cat.id] = r.amount; });
+    var out = [];
+    curRows.forEach(function(r){
+      var cur = r.amount;
+      var prev = prevByCat[r.cat.id] || 0;
+      var diff = cur - prev;
+      if(Math.abs(diff) < 100) return;
+      if(prev <= 0){
+        out.push({ diff: diff, text: 'Bu ay ilk kez ' + esc(r.cat.name) + ' kategorisinde harcama yaptınız: ' + fmtTRY(cur) + '.', kind:'new' });
+        return;
+      }
+      var pct = (diff/prev*100);
+      if(Math.abs(pct) < 15) return;
+      var yon = diff>0 ? 'daha fazla' : 'daha az';
+      out.push({ diff: Math.abs(diff), text: esc(r.cat.name) + ' kategorisinde geçen aya göre %' + Math.abs(Math.round(pct)) + ' ' + yon + ' harcadınız (' + (diff>0?'+':'−') + fmtTRY(Math.abs(diff)) + ').', kind: diff>0?'up':'down' });
+    });
+    /* toplam gider karşılaştırması, varsa her zaman ilk sırada */
+    var curTotal = totalsForMonth(monthKeyStr).expense;
+    var prevTotal = totalsForMonth(prevMk).expense;
+    if(prevTotal > 0 && curTotal > 0){
+      var totalDiff = curTotal - prevTotal;
+      var totalPct = (totalDiff/prevTotal*100);
+      if(Math.abs(totalPct) >= 10 && Math.abs(totalDiff) >= 200){
+        var totalYon = totalDiff>0 ? 'daha fazla' : 'daha az';
+        out.unshift({ diff: Infinity, text: 'Bu ay toplamda geçen aya göre %' + Math.abs(Math.round(totalPct)) + ' ' + totalYon + ' harcadınız (' + (totalDiff>0?'+':'−') + fmtTRY(Math.abs(totalDiff)) + ').', kind: totalDiff>0?'up':'down' });
+      }
+    }
+    out.sort(function(a,b){ return b.diff-a.diff; });
+    return out.slice(0,4);
+  }
+
+  /* ---------------- Tarih bazlı genel hatırlatıcılar ----------------
+     state.reminders: { id, title, date (YYYY-MM-DD, ilk/tek seferlik tarih),
+     repeatYearly, note }. Yıllık tekrar işaretliyse, bu yılki gün geçmişse
+     bir sonraki yıla döner; işaretli değilse tarih olduğu gibi kullanılır. */
+  function nextReminderOccurrence(r){
+    if(!r.repeatYearly) return r.date;
+    var today = todayISO();
+    var md = r.date.slice(5); // "AA-GG"
+    var thisYear = today.slice(0,4) + '-' + md;
+    return thisYear >= today ? thisYear : (parseInt(today.slice(0,4),10)+1) + '-' + md;
+  }
+  function daysUntil(dateISO){
+    var oneDay = 24*60*60*1000;
+    var a = new Date(todayISO() + 'T00:00:00');
+    var b = new Date(dateISO + 'T00:00:00');
+    return Math.round((b-a)/oneDay);
+  }
+  /* Önümüzdeki 7 gün içinde (bugün dahil, geçmişse de hâlâ "gördün mü" diye)
+     olan genel hatırlatıcılar — kredi kartı ödeme hatırlatıcıları ayrı
+     fonksiyonda (creditCardDueSoonReminders). */
+  function upcomingReminders(){
+    return state.reminders.map(function(r){
+      var occ = nextReminderOccurrence(r);
+      return { reminder: r, date: occ, days: daysUntil(occ) };
+    }).filter(function(x){ return x.days <= 7 && x.reminder.dismissedOccurrence !== x.date; })
+      .sort(function(a,b){ return a.days-b.days; });
+  }
+  /* Her kredi kartının bu ayki ödeme gününe 3/2/1 gün kala (ve tam ödeme
+     gününde) hatırlatıcı üretir — yalnızca ödenmemiş (pozitif) borcu varsa. */
+  function creditCardDueSoonReminders(){
+    var mk = currentMonthKey();
+    var out = [];
+    state.accounts.filter(function(a){ return a.type==='card' && a.statementDay && a.paymentDay; }).forEach(function(a){
+      var payDate = cardPaymentDateForStatement(a, mk);
+      var days = daysUntil(payDate);
+      if(days < 0 || days > 3) return;
+      var bal = accountBalance(a.id);
+      if(bal <= 0) return;
+      out.push({ account: a, date: payDate, days: days, balance: bal });
+    });
+    out.sort(function(a,b){ return a.days-b.days; });
     return out;
   }
 
@@ -1713,7 +1892,7 @@
   }
 
   function renderTopbar(){
-    var titles = { ozet:'Özet', hareketler:'Hareketler', hesaplar:'Hesaplar', raporlar:'Raporlar', sifreler:'Şifreler', ayarlar:'Ayarlar' };
+    var titles = { ozet:'Özet', hareketler:'Hareketler', hesaplar:'Hesaplar', raporlar:'Raporlar', bilgi:'Finansal Bilgilendirme', sifreler:'Şifreler', ayarlar:'Ayarlar' };
     return '<div class="topbar">' +
       '<div class="brand">Hane Defteri<small>' + esc(titles[ui.tab]||'') + '</small></div>' +
       (ui.readOnly ? '<span class="readonly-chip">Salt okunur</span>' : '') +
@@ -1732,6 +1911,7 @@
       {id:'hareketler', label:'Hareketler', icon:'list'},
       {id:'hesaplar', label:'Hesaplar', icon:'wallet'},
       {id:'raporlar', label:'Raporlar', icon:'chart'},
+      {id:'bilgi', label:'Bilgi', icon:'coin'},
       {id:'sifreler', label:'Şifreler', icon:'lock'},
       {id:'ayarlar', label:'Ayarlar', icon:'settings'}
     ];
@@ -1746,6 +1926,7 @@
     if(ui.tab==='hareketler') return renderHareketler();
     if(ui.tab==='hesaplar') return renderHesaplar();
     if(ui.tab==='raporlar') return renderRaporlar();
+    if(ui.tab==='bilgi') return renderFinansalBilgi();
     if(ui.tab==='sifreler') return renderSifreler();
     if(ui.tab==='ayarlar') return renderAyarlar();
     return renderOzet();
@@ -1760,6 +1941,7 @@
     html += renderPlannedBanner();
     html += renderRecurringBanner();
     html += renderBudgetWarningBanner();
+    html += renderReminderBanner();
 
     var netWorthNow = netWorthAsOf(mk, true);
     var nwPos = netWorthNow >= 0;
@@ -2456,13 +2638,24 @@
     }
     html += '</div>';
 
+    html += renderInsightsSection(mk);
+    html += renderSubscriptionsCard();
+
     var budgetByCat = {};
     budgetStatusForMonth(mk).forEach(function(b){ budgetByCat[b.cat.id] = b; });
 
+    /* Bütçesi tanımlı ama bu ay henüz hiç gerçek harcaması olmayan kategoriler
+       (ör. yalnızca henüz "Ekle" denmemiş bir abonelik borcu olan kategori)
+       de burada, sıfır çubukla ama bütçe/abonelik notuyla birlikte gösterilir
+       — aksi halde "beklenen abonelik" notu hiçbir yerde görünmezdi. */
+    var budgetOnlyRows = budgetStatusForMonth(mk).filter(function(b){
+      return !expRows.some(function(r){ return r.cat.id===b.cat.id; });
+    }).map(function(b){ return { cat:b.cat, amount:0, plannedAmount:0 }; });
+
     html += '<div class="section-title">Gider Dağılımı</div><div class="card">';
-    if(!expRows.length){ html += renderEmpty('Bu ay gider kaydı yok.'); }
+    if(!expRows.length && !budgetOnlyRows.length){ html += renderEmpty('Bu ay gider kaydı yok.'); }
     else {
-      expRows.forEach(function(r){
+      expRows.concat(budgetOnlyRows).forEach(function(r){
         var pct = t.expense>0 ? (r.amount/t.expense*100) : 0;
         var b = budgetByCat[r.cat.id];
         html += '<div class="bar-row"><div class="bhead"><span>' + esc(r.cat.name) + '</span><span class="num">' + fmtTRY(r.amount) + ' · %' + pct.toFixed(0) + (r.plannedAmount>0 ? ' <span class="mute2">(+' + fmtTRY(r.plannedAmount) + ' planlanan)</span>' : '') + '</span></div>' +
@@ -2538,12 +2731,29 @@
 
   /* Bir kategori satırının altına, bütçe tanımlıysa "Bütçe: X ₺ · %Y kullanıldı"
      bilgisini (aşım/yaklaşma durumuna göre renkli) ekler. */
+  /* Harcama alışkanlığı içgörüleri: yalnızca cari ay seçiliyken anlamlı
+     (geçmiş ay/gelecek ay karşılaştırması için); geçmiş/gelecek aylarda
+     gösterilmez. */
+  function renderInsightsSection(mk){
+    if(mk !== currentMonthKey()) return '';
+    var insights = spendingInsights(mk);
+    if(!insights.length) return '';
+    var html = '<div class="section-title">Harcama Alışkanlığı İçgörüleri</div><div class="card">';
+    insights.forEach(function(ins){
+      var color = ins.kind==='up' ? 'var(--expense)' : (ins.kind==='down' ? 'var(--income)' : 'var(--ink)');
+      html += '<div class="row" style="align-items:flex-start;gap:8px">' + icon('insight') + '<span style="color:' + color + '">' + ins.text + '</span></div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
   function renderBudgetLine(b){
     if(!b) return '';
     var color = b.level==='over' ? 'var(--expense)' : (b.level==='warn' ? '#c47a00' : 'var(--mute)');
     var msg = b.level==='over'
       ? 'Bütçe aşıldı: ' + fmtTRY(b.spent) + ' / ' + fmtTRY(b.limit) + ' (%' + b.pct.toFixed(0) + ')'
       : 'Bütçe: ' + fmtTRY(b.spent) + ' / ' + fmtTRY(b.limit) + ' · %' + b.pct.toFixed(0) + ' kullanıldı';
+    if(b.pendingSub>0) msg += ' <span class="mute2">(+' + fmtTRY(b.pendingSub) + ' bu ayki abonelik, henüz eklenmedi)</span>';
     return '<div class="mute2 budget-line" style="margin-top:2px;color:' + color + '">' + msg + '</div>';
   }
 
@@ -2560,6 +2770,31 @@
         ? 'Limit aşıldı: ' + fmtTRY(b.spent) + ' / ' + fmtTRY(b.limit)
         : '%' + b.pct.toFixed(0) + ' kullanıldı: ' + fmtTRY(b.spent) + ' / ' + fmtTRY(b.limit);
       html += '<div class="recur-item"><div class="recur-item-main"><div class="n" style="color:' + color + '">' + esc(b.cat.name) + '</div><div class="s">' + desc + '</div></div></div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
+  /* Genel tarih bazlı hatırlatıcılar (sigorta, muayene, garanti vb. —
+     madde 6) + kredi kartı ödeme günü hatırlatıcıları (3/2/1 gün kala),
+     tek bir banner'da birleşik. */
+  function renderReminderBanner(){
+    var general = upcomingReminders();
+    var cards = creditCardDueSoonReminders();
+    if(!general.length && !cards.length) return '';
+    var html = '<div class="card recur-banner reminder-banner">';
+    html += '<div class="recur-banner-head">' + icon('bell') + '<span>Hatırlatıcılar</span></div>';
+    cards.forEach(function(c){
+      var when = c.days===0 ? 'Bugün' : (c.days===1 ? 'Yarın' : c.days + ' gün sonra');
+      html += '<div class="recur-item"><div class="recur-item-main"><div class="n">' + esc(c.account.name) + ' ödemesi</div>' +
+        '<div class="s">' + when + ' (' + fmtDate(c.date) + ') · ' + fmtTRY(c.balance) + '</div></div></div>';
+    });
+    general.forEach(function(x){
+      var when = x.days<0 ? Math.abs(x.days) + ' gün önce geçti' : (x.days===0 ? 'Bugün' : (x.days===1 ? 'Yarın' : x.days + ' gün sonra'));
+      html += '<div class="recur-item"><div class="recur-item-main"><div class="n">' + esc(x.reminder.title) + '</div>' +
+        '<div class="s">' + when + ' (' + fmtDate(x.date) + ')' + (x.reminder.note ? ' · ' + esc(x.reminder.note) : '') + '</div></div>' +
+        (ui.readOnly ? '' : '<div class="recur-item-actions"><button class="btn btn-ghost btn-sm" data-action="dismiss-reminder" data-id="' + x.reminder.id + '">Gördüm</button></div>') +
+        '</div>';
     });
     html += '</div>';
     return html;
@@ -2584,6 +2819,67 @@
       '<input type="email" name="email" placeholder="davet@ornek.com" required style="flex:1">' +
       '<button class="btn btn-primary" type="submit">Davet Et</button></form>';
     html += '<p class="mute2" style="margin-top:6px">Davet ettiğiniz kişi kendi Google hesabıyla giriş yaptığında bu hane defterine otomatik katılır ve aynı verileri görür/düzenler. Davet edilmemiş biri kendi Google hesabıyla girerse, kendi ayrı ve boş bir hane defteriyle karşılaşır.</p>';
+    return html;
+  }
+
+  /* ---------------- FİNANSAL BİLGİLENDİRME ----------------
+     Kullanıcı isteği: canlı/otomatik kur çekimi sisteme (Net Varlık'a vb.)
+     KESİNLİKLE dahil edilmesin (manuel kur felsefesi korunuyor — madde 2),
+     ama Finansal Bilgilendirme'de "bilgi amaçlı" güncel kur/altın görülebilsin.
+     Veri, GitHub Actions ile HER GÜN otomatik (Claude'a veya herhangi bir
+     manuel işleme bağlı olmadan) frankfurter.dev (ECB, ücretsiz/keysiz/
+     limitsiz) ve gold-api.com (ücretsiz/keysiz/limitsiz) kaynaklarından
+     çekilip docs/rates.json'a yazılır (bkz. scripts/fetch-rates.js ve
+     .github/workflows/fetch-rates.yml). Bu sekme yalnızca o statik dosyayı
+     okur — kendi başına hiçbir dış servise bağlanmaz. Yalnızca bağımsız
+     sitede anlamlıdır (docs/rates.json yalnızca orada, sayfayla aynı yerde
+     durur); Claude Artifact sürümünde bilgilendirici bir mesaj gösterilir. */
+  function fetchFinRates(){
+    if(BACKEND!=='firebase') return;
+    ui.finRatesLoading = true;
+    ui.finRatesError = null;
+    render();
+    fetch('./rates.json?_=' + Date.now(), { cache:'no-store' }).then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function(data){
+      ui.finRates = data;
+      ui.finRatesLoading = false;
+      render();
+    }).catch(function(err){
+      ui.finRatesError = 'Kur bilgisi yüklenemedi: ' + (err && err.message ? err.message : 'bilinmeyen hata');
+      ui.finRatesLoading = false;
+      render();
+    });
+  }
+
+  function renderFinansalBilgi(){
+    var html = '<div class="section-title">Güncel Kur ve Altın Bilgisi</div>';
+    if(BACKEND!=='firebase'){
+      html += '<div class="card"><p class="mute2">Bu bilgi yalnızca bağımsız site sürümünde kullanılabilir; otomatik günlük güncelleme GitHub üzerinde çalışır ve bu Claude Artifact görünümüne dahil değildir.</p></div>';
+      return html;
+    }
+    html += '<div class="card">';
+    if(ui.finRatesLoading){
+      html += '<p class="mute2">Yükleniyor…</p>';
+    } else if(ui.finRatesError){
+      html += '<p class="mute2" style="color:var(--critical)">' + esc(ui.finRatesError) + '</p>';
+      html += '<p class="mute2">Bu, günlük otomatik güncellemenin ilk kez henüz çalışmamış olmasından da kaynaklanabilir.</p>';
+    } else if(ui.finRates){
+      var fr = ui.finRates;
+      html += '<table class="kv-table">';
+      if(fr.usdTry!=null) html += '<tr><td>USD / TRY</td><td class="num">' + fr.usdTry.toFixed(4) + '</td></tr>';
+      if(fr.eurTry!=null) html += '<tr><td>EUR / TRY</td><td class="num">' + fr.eurTry.toFixed(4) + '</td></tr>';
+      if(fr.gramAltinTry!=null) html += '<tr><td>Gram Altın (TRY)</td><td class="num">' + fmtTRY(fr.gramAltinTry) + '</td></tr>';
+      if(fr.onsAltinUsd!=null) html += '<tr><td>Ons Altın (USD)</td><td class="num">$' + fr.onsAltinUsd.toFixed(2) + '</td></tr>';
+      html += '</table>';
+      if(fr.updatedAt) html += '<p class="mute2" style="padding:0 14px 12px">Son güncelleme: ' + esc(fmtDateTime(fr.updatedAt)) + ' (her gün otomatik güncellenir)</p>';
+    }
+    html += '</div>';
+    if(!ui.finRatesLoading){
+      html += '<button class="btn btn-ghost btn-sm" style="margin-top:10px" data-action="finrates-refresh">' + icon('repeat') + ' Yenile</button>';
+    }
+    html += '<p class="mute2" style="margin-top:14px">Bu sayfadaki kur ve altın bilgisi yalnızca bilgilendirme amaçlıdır; hesaplarınızdaki döviz cinsinden bakiyeler ve Net Varlık hesaplaması hâlâ Ayarlar\'da sizin girdiğiniz manuel kuru kullanır, buradaki otomatik veriden ETKİLENMEZ.</p>';
     return html;
   }
 
@@ -2759,6 +3055,7 @@
     html += renderFxRatesSection();
     html += renderRecurringSection();
     html += renderBudgetSection();
+    html += renderRemindersSection();
     html += renderShareShortcutCard();
 
     html += '<div class="section-title">Veri</div><div class="card">';
@@ -2789,6 +3086,7 @@
     html += '<div class="row" style="margin-top:10px"><div class="stack"><span>Tüm veriyi yedekle</span><span class="mute2">JSON — tüm hesap/hareket/ayarları içerir</span></div>' +
       '<button class="btn btn-sm" data-action="export-json">' + icon('download') + ' JSON İndir</button></div>';
     html += '<p class="mute2" style="margin-top:8px">Not: Bu platformda gerçek bir .xlsx (Excel ikili) dosyası üretilemiyor; CSV dosyası Excel\'de doğrudan açılır ve aynı işi görür.</p>';
+    if(BACKEND==='firebase') html += renderBackupsSubsection();
     html += '</div>';
 
     html += renderAuditLogSection();
@@ -2802,6 +3100,30 @@
   /* Kayıt geçmişi / denetim kaydı (madde 7): kişi bazlı yetkilendirme yerine,
      sadece "kim ne zaman ne yaptı" bilgisini gösteren salt-okunur bir liste.
      Herkese görünür (erişim kısıtlaması yok), en son 30 kayıt gösterilir. */
+  /* Otomatik periyodik yedekleme (Ayarlar > Veri): her gün otomatik alınan
+     yedeklerin listesi (istenince çekilir) + geri yükleme. */
+  function renderBackupsSubsection(){
+    var html = '<div class="row" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px"><div class="stack"><span>Otomatik Yedekler</span><span class="mute2">Her gün otomatik alınır, son 30 gün saklanır.</span></div>';
+    if(ui.backupsList==null){
+      html += '<button class="btn btn-sm" data-action="view-backups">Yedekleri Görüntüle</button>';
+    }
+    html += '</div>';
+    if(ui.backupsList==='loading'){
+      html += '<p class="mute2" style="margin-top:6px">Yükleniyor…</p>';
+    } else if(Array.isArray(ui.backupsList)){
+      if(!ui.backupsList.length){
+        html += '<p class="mute2" style="margin-top:6px">Henüz otomatik yedek yok.</p>';
+      } else {
+        ui.backupsList.forEach(function(b){
+          html += '<div class="switch-row"><span>' + esc(fmtDate(b.id)) + '</span>' +
+            (ui.readOnly ? '' : '<button class="btn btn-ghost btn-sm" data-action="restore-backup" data-id="' + esc(b.id) + '">Bu Tarihe Geri Yükle</button>') +
+            '</div>';
+        });
+      }
+    }
+    return html;
+  }
+
   function renderAuditLogSection(){
     var log = (state.auditLog||[]).slice().reverse();
     var html = '<div class="section-title">Kayıt Geçmişi</div><div class="card">';
@@ -2958,7 +3280,7 @@
         sub.push(acct ? acct.name : 'Hesap silinmiş');
         if(r.totalInstallments) sub.push((r.totalInstallments - r.installmentsRemaining) + '/' + r.totalInstallments + ' taksit ödendi');
         if(!r.active) sub.push('Duraklatıldı');
-        html += '<div class="switch-row"><div class="stack"><span>' + esc(r.name) + '</span><span class="mute2">' + sub.map(esc).join(' · ') + '</span></div>' +
+        html += '<div class="switch-row"><div class="stack"><span>' + esc(r.name) + (r.isSubscription ? ' <span class="pill pill-neutral">Abonelik</span>' : '') + '</span><span class="mute2">' + sub.map(esc).join(' · ') + '</span></div>' +
           (ui.readOnly ? '' : '<div style="display:flex;gap:4px;flex:none">' +
             '<button class="btn btn-ghost btn-sm" data-action="toggle-recurring" data-id="' + r.id + '">' + (r.active ? 'Duraklat' : 'Etkinleştir') + '</button>' +
             '<button class="btn btn-ghost btn-sm" data-action="delete-recurring" data-id="' + r.id + '" aria-label="Sil">' + icon('trash') + '</button>' +
@@ -2990,8 +3312,75 @@
     html += '<div class="field"><label>Kategori</label><select name="categoryId" required>' + cats.map(function(c){ return '<option value="' + c.id + '"' + (f.categoryId===c.id?' selected':'') + '>' + esc(c.name) + '</option>'; }).join('') + '</select></div>';
     html += '<div class="field-row field"><div><label>Hesap</label><select name="accountId" required>' + accountOptions(f.accountId, null) + '</select></div>' +
       '<div><label>Kişi</label><select name="personId">' + personOptions(f.personId) + '</select></div></div>';
+    if(f.type==='expense'){
+      html += '<label class="switch-row" style="cursor:pointer"><span>Bu bir abonelik</span><input type="checkbox" name="isSubscription" value="1"' + (f.isSubscription?' checked':'') + '></label>';
+    }
     html += '<input type="hidden" name="type" value="' + f.type + '">';
     html += '<div style="display:flex;gap:10px"><button type="button" class="btn" data-action="recurring-form-cancel">Vazgeç</button><button type="submit" class="btn btn-primary btn-block">Kaydet</button></div>';
+    html += '</form></div>';
+    return html;
+  }
+
+  /* Abonelik paneli: aktif abonelikleri ve toplam aylık maliyeti tek bakışta
+     gösteren kart (Raporlar'da). Kullanıcı isteği: bu tutarların ilgili
+     kategori bütçelerine ve nakit akışı projeksiyonuna yansıması — bkz.
+     budgetStatusForMonth() (pendingSub) ve cashFlowProjection()
+     (indefiniteRecurringNet, süresiz aboneliklerin zaten dahil olduğu yer). */
+  function renderSubscriptionsCard(){
+    var subs = activeSubscriptions();
+    if(!subs.length) return '';
+    var total = subscriptionsMonthlyTotal();
+    var html = '<div class="section-title">Aktif Abonelikleriniz</div><div class="card">';
+    subs.forEach(function(r){
+      var acct = getAccount(r.accountId);
+      var cat = getCategory('expense', r.categoryId);
+      html += '<div class="switch-row"><div class="stack"><span>' + esc(r.name) + '</span><span class="mute2">' + [cat?cat.name:'', 'Her ayın ' + r.day + '. günü', acct?acct.name:'Hesap silinmiş'].filter(Boolean).map(esc).join(' · ') + '</span></div>' +
+        '<span class="num">' + fmtTRY(r.amount) + '</span></div>';
+    });
+    html += '<div class="row" style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px"><span style="font-weight:600">Toplam Aylık Abonelik Maliyeti</span><span class="num" style="font-weight:600">' + fmtTRY(total) + '</span></div>';
+    html += '</div>';
+    return html;
+  }
+
+  /* ---------------- Tarih bazlı genel hatırlatıcılar — yönetim (Ayarlar) ---------------- */
+  function renderRemindersSection(){
+    var html = '<div class="section-title">Hatırlatıcılar</div><div class="card">';
+    if(!state.reminders.length){
+      html += renderEmpty('Henüz bir hatırlatıcı eklenmedi (ör. sigorta yenileme, araç muayenesi, garanti bitişi).');
+    } else {
+      state.reminders.slice().sort(function(a,b){ return nextReminderOccurrence(a) < nextReminderOccurrence(b) ? -1 : 1; }).forEach(function(r){
+        var occ = nextReminderOccurrence(r);
+        var sub = [fmtDate(occ)];
+        if(r.repeatYearly) sub.push('Her yıl tekrarlar');
+        if(r.note) sub.push(r.note);
+        html += '<div class="switch-row"><div class="stack"><span>' + esc(r.title) + '</span><span class="mute2">' + sub.map(esc).join(' · ') + '</span></div>' +
+          (ui.readOnly ? '' : '<div style="display:flex;gap:4px;flex:none">' +
+            '<button class="btn btn-ghost btn-sm" data-action="edit-reminder" data-id="' + r.id + '" aria-label="Düzenle">' + icon('edit') + '</button>' +
+            '<button class="btn btn-ghost btn-sm" data-action="delete-reminder" data-id="' + r.id + '" aria-label="Sil">' + icon('trash') + '</button>' +
+            '</div>') +
+          '</div>';
+      });
+    }
+    html += '</div>';
+    if(!ui.readOnly){
+      if(!ui.reminderForm){
+        html += '<button class="btn btn-ghost btn-sm" style="margin-top:10px" data-action="reminder-new">' + icon('plus') + ' Hatırlatıcı Ekle</button>';
+      } else {
+        html += renderReminderForm();
+      }
+    }
+    return html;
+  }
+
+  function renderReminderForm(){
+    var f = ui.reminderForm;
+    var html = '<div class="card" style="margin-top:10px"><form data-action="save-reminder">';
+    html += '<div class="field"><label>Başlık</label><input id="modal-first-input" type="text" name="title" placeholder="ör. Kasko Yenileme" value="' + esc(f.title||'') + '" required></div>';
+    html += '<div class="field"><label>Tarih</label><input type="date" name="date" value="' + esc(f.date||'') + '" required></div>';
+    html += '<label class="switch-row" style="cursor:pointer"><span>Her yıl tekrarlar</span><input type="checkbox" name="repeatYearly" value="1"' + (f.repeatYearly?' checked':'') + '></label>';
+    html += '<div class="field"><label>Not (opsiyonel)</label><input type="text" name="note" value="' + esc(f.note||'') + '"></div>';
+    html += '<input type="hidden" name="id" value="' + esc(f.id||'') + '">';
+    html += '<div style="display:flex;gap:10px"><button type="button" class="btn" data-action="reminder-form-cancel">Vazgeç</button><button type="submit" class="btn btn-primary btn-block">Kaydet</button></div>';
     html += '</form></div>';
     return html;
   }
@@ -3092,6 +3481,9 @@
       html += '<p class="mute2">Bir ekstre veya Excel tablosunu doğrudan yapıştırabilirsiniz. Her satır bir kayıt olur, sütunlar TAB (Excel\'den kopyala-yapıştır) veya <b>;</b> ile ayrılmalı:</p>';
       html += '<p class="mute2" style="font-family:monospace;background:var(--surface2,#f2f2f2);padding:8px;border-radius:8px;overflow-x:auto;white-space:pre">Tarih;Tür;Tutar;Kategori;Hesap;Kişi (ops);Not (ops)\n2026-08-15;Gider;350,00;Market / Gıda;Nakit;Ergin;Haftalık market</p>';
       html += '<p class="mute2">Tarih olarak <b>YYYY-AA-GG</b> veya <b>GG.AA.YYYY</b>; tutar olarak <b>350,00</b> veya <b>350.00</b> yazılabilir. Kategori ve hesap adları Ayarlar/Hesaplar\'da tanımlı isimlerle birebir (büyük/küçük harf önemsiz) eşleşmeli.</p>';
+      html += '<div class="field"><label>Veya bir dosyadan yükleyin</label>' +
+        '<input type="file" accept=".csv,.txt" data-action="bulk-import-file" style="width:100%">' +
+        '<span class="mute2">Bankanızın indirdiğiniz ekstre dosyası — yalnızca CSV/metin biçimi desteklenir; Excel dosyanız varsa "Farklı Kaydet &gt; CSV" ile kaydedip öyle yükleyin.</span></div>';
       html += '<div class="field"><textarea id="bulk-import-textarea" rows="8" placeholder="Verinizi buraya yapıştırın..." style="width:100%;font-family:monospace;font-size:0.85rem">' + esc(bi.text||'') + '</textarea></div>';
       html += '<div style="display:flex;gap:10px"><button type="button" class="btn" data-action="close-modal">Vazgeç</button>' +
         '<button type="button" class="btn btn-primary btn-block" data-action="bulk-import-preview">Önizle</button></div>';
@@ -3634,7 +4026,9 @@
     render();
     if(BACKEND === 'firebase'){
       if(!fbHouseholdRef || !state) return;
-      fbHouseholdRef.update({ state: state, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }).catch(function(err){
+      fbHouseholdRef.update({ state: state, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }).then(function(){
+        fbSaveDailyBackupIfNeeded();
+      }).catch(function(err){
         showToast('Kaydedilemedi: ' + (err && err.message ? err.message : 'bilinmeyen hata'));
       });
       return;
@@ -3699,7 +4093,21 @@
     if(!el) return;
     var action = el.getAttribute('data-action');
 
-    if(action==='tab'){ ui.tab = el.getAttribute('data-tab'); render(); return; }
+    if(action==='tab'){
+      ui.tab = el.getAttribute('data-tab');
+      if(ui.tab==='bilgi' && BACKEND==='firebase' && !ui.finRates && !ui.finRatesLoading && !ui.finRatesError){ fetchFinRates(); return; }
+      render(); return;
+    }
+    if(action==='finrates-refresh'){ fetchFinRates(); return; }
+
+    /* ---- otomatik yedekler ---- */
+    if(action==='view-backups'){ fbListBackups(); return; }
+    if(action==='restore-backup'){
+      var rbId = el.getAttribute('data-id');
+      ui.modal = 'confirm';
+      ui.modalData = { title:'Yedeği geri yükle', message: fmtDate(rbId) + ' tarihli yedek geri yüklenecek; bu tarihten SONRA yaptığınız tüm değişiklikler kaybolacak. Bu işlem geri alınamaz.', onConfirm:{ kind:'restoreBackup', id: rbId } };
+      render(); return;
+    }
 
     /* ---- Google ile Giriş (bağımsız barındırma) ---- */
     if(action==='fb-sign-in'){ fbSignIn(); return; }
@@ -4099,6 +4507,25 @@
       render(); return;
     }
 
+    /* ---- hatırlatıcılar ---- */
+    if(action==='reminder-new'){ ui.reminderForm = { date: todayISO() }; render(); return; }
+    if(action==='reminder-form-cancel'){ ui.reminderForm = null; render(); return; }
+    if(action==='edit-reminder'){
+      var editRem = state.reminders.find(function(x){ return x.id===el.getAttribute('data-id'); });
+      ui.reminderForm = editRem ? Object.assign({}, editRem) : { date: todayISO() };
+      render(); return;
+    }
+    if(action==='delete-reminder'){
+      ui.modal = 'confirm';
+      ui.modalData = { title:'Hatırlatıcıyı sil', message:'Bu hatırlatıcı kalıcı olarak silinecek.', onConfirm:{ kind:'reminder', id: el.getAttribute('data-id') } };
+      render(); return;
+    }
+    if(action==='dismiss-reminder'){
+      var dismRem = state.reminders.find(function(x){ return x.id===el.getAttribute('data-id'); });
+      if(dismRem){ dismRem.dismissedOccurrence = nextReminderOccurrence(dismRem); persist(); }
+      return;
+    }
+
     /* ---- Şifre Kasası ---- */
     if(action==='vault-add'){ ui.modalData = {}; ui.modal = 'vaultEntry'; render(); return; }
     if(action==='vault-edit'){
@@ -4151,6 +4578,15 @@
 
     if(action==='confirm-yes'){
       var c = (ui.modalData && ui.modalData.onConfirm) || {};
+      if(c.kind==='restoreBackup'){
+        /* fbRestoreBackup() Firestore'dan ASENKRON okuyup KENDİ persist()'ini
+           çağırıyor; buradaki genel (senkron) persist()'e girersek henüz
+           yüklenmemiş eski state'i geri yazıp yarış durumu yaratırız — bu
+           yüzden erken çıkıyoruz. */
+        closeModal();
+        fbRestoreBackup(c.id);
+        return;
+      }
       if(c.kind==='tx'){
         var delTx = state.transactions.find(function(t){ return t.id===c.id; });
         state.transactions = state.transactions.filter(function(t){ return t.id!==c.id; });
@@ -4193,6 +4629,11 @@
         if(delGoal) logAudit('goal-delete', 'Hedef silindi: ' + delGoal.name);
       }
       else if(c.kind==='template'){ state.templates = state.templates.filter(function(x){ return x.id!==c.id; }); }
+      else if(c.kind==='reminder'){
+        var delRem = state.reminders.find(function(x){ return x.id===c.id; });
+        state.reminders = state.reminders.filter(function(x){ return x.id!==c.id; });
+        if(delRem) logAudit('reminder-delete', 'Hatırlatıcı silindi: ' + delRem.title);
+      }
       else if(c.kind==='vaultEntry'){
         var delVaultEntry = (state.passwordVault.entries||[]).find(function(x){ return x.id===c.id; });
         state.passwordVault.entries = (state.passwordVault.entries||[]).filter(function(x){ return x.id!==c.id; });
@@ -4237,6 +4678,18 @@
         ui.modalData = Object.assign({}, ui.modalData, { receipt: dataUrl });
         render();
       });
+    }
+    if(e.target.matches('[data-action="bulk-import-file"]') && e.target.files && e.target.files[0]){
+      var biFile = e.target.files[0];
+      var biReader = new FileReader();
+      biReader.onload = function(){
+        var biTa2 = document.getElementById('bulk-import-textarea');
+        if(biTa2) biTa2.value = String(biReader.result||'');
+        ui.bulkImport = Object.assign({}, ui.bulkImport, { text: String(biReader.result||'') });
+        showToast('Dosya yüklendi: ' + biFile.name + ' — "Önizle"ye basarak devam edin.');
+      };
+      biReader.onerror = function(){ showToast('Dosya okunamadı, tekrar deneyin.'); };
+      biReader.readAsText(biFile, 'utf-8');
     }
   });
 
@@ -4614,14 +5067,36 @@
       var recCategoryId = fd.get('categoryId') || null;
       var recPersonId = fd.get('personId') || null;
       var recType = fd.get('type') || 'expense';
+      var recIsSubscription = recType==='expense' && fd.get('isSubscription')==='1';
       if(!recName || recAmount<=0 || !recAccountId || !recCategoryId){ showToast('Lütfen tüm zorunlu alanları doldurun.'); return; }
       state.recurring.push({
         id: uid('rec'), name: recName, type: recType, amount: recAmount,
         categoryId: recCategoryId, accountId: recAccountId, personId: recPersonId || null,
-        day: recDay, active: true, skippedMonths: [], installmentsRemaining: null, totalInstallments: null
+        day: recDay, active: true, skippedMonths: [], installmentsRemaining: null, totalInstallments: null,
+        isSubscription: recIsSubscription
       });
       logAudit('recurring-add', 'Düzenli ödeme eklendi: ' + recName + ' (' + fmtTRY(recAmount) + ')');
       ui.recurringForm = null;
+      persist();
+      return;
+    }
+
+    if(action==='save-reminder'){
+      var remTitle = (fd.get('title')||'').trim();
+      var remDate = fd.get('date') || '';
+      var remRepeat = fd.get('repeatYearly')==='1';
+      var remNote = (fd.get('note')||'').trim();
+      var remId = fd.get('id');
+      if(!remTitle || !remDate){ showToast('Lütfen başlık ve tarih girin.'); return; }
+      if(remId){
+        var ridx = state.reminders.findIndex(function(x){ return x.id===remId; });
+        if(ridx>-1) state.reminders[ridx] = Object.assign({}, state.reminders[ridx], { title:remTitle, date:remDate, repeatYearly:remRepeat, note:remNote, dismissedOccurrence:null });
+        logAudit('reminder-edit', 'Hatırlatıcı güncellendi: ' + remTitle);
+      } else {
+        state.reminders.push({ id: uid('rem'), title:remTitle, date:remDate, repeatYearly:remRepeat, note:remNote, dismissedOccurrence:null });
+        logAudit('reminder-add', 'Hatırlatıcı eklendi: ' + remTitle);
+      }
+      ui.reminderForm = null;
       persist();
       return;
     }
