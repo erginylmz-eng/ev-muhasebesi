@@ -17,6 +17,15 @@ jobs:
       - name: Bağımlılıkları kur
         run: npm install
 
+      - name: Backend (server/) bağımlılıklarını kur
+        # tests/server-smoke.test.js, server/server.js'i gerçek bir Node
+        # süreci olarak başlatıyor (express, google-auth-library, vb. gerekir).
+        # server/, kökten AYRI bir package.json'a sahip (kendi başına
+        # dağıtılabilmesi için) — bu yüzden npm install kökte otomatik olarak
+        # bunu kurmaz.
+        run: npm install
+        working-directory: server
+
       - name: Playwright Chromium'u kur
         run: npx playwright install --with-deps chromium
 

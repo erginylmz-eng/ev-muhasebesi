@@ -370,32 +370,48 @@
   .helptext{ font-size:0.74rem; color:var(--ink-mute); margin-top:4px; }
 
 </style>
-<!-- Firebase (Auth + Firestore) — bağımsız barındırma için: kimlik Google ile
-     Giriş, veri Firestore'da households/{id} dokümanında saklanır. -->
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<!-- Firebase YOK: kimlik doğrulama ve veri saklama tamamen kendi sunucumuzdaki
+     Node/Express backend (server/server.js) üzerinden yapılır — Google ile
+     Giriş doğrudan OAuth 2.0 ile (google-auth-library), veri JSON dosyalarında
+     (server/lib/store.js) saklanır. Hiçbir Firebase SDK'sı veya Firebase
+     projesi ile bağlantı yoktur. */ -->
 <script>
-  window.__FIREBASE_CONFIG__ = {"apiKey":"AIzaSyC436fhXMrNRwrzem9jfeZ7SqbIdVhZqD4","authDomain":"finansal-durum-takibi.firebaseapp.com","projectId":"finansal-durum-takibi","storageBucket":"finansal-durum-takibi.firebasestorage.app","messagingSenderId":"293002356680","appId":"1:293002356680:web:8d5b0da5f4f35adb9a02fd"};
+  window.__SELFHOSTED__ = true;
 </script>
 </head>
 <body>
 <div id="app"></div>
 <script id="app-script">
 /* Yılmaz Hane Defteri — ev muhasebesi uygulaması
-   İki farklı barındırma ortamını destekler (aşağıdaki BACKEND değişkenine bakınız):
+   Üç farklı barındırma ortamını destekler (aşağıdaki BACKEND değişkenine bakınız):
    1) Claude Artifact — paylaşılan aile verisi Claude'un "artifact" runtime
       yeteneği ile HTML içine gömülü olarak saklanır.
-   2) Bağımsız barındırma (ör. GitHub Pages) — window.__FIREBASE_CONFIG__
+   2) Firebase (ör. GitHub Pages üzerinde eski kurulum) — window.__FIREBASE_CONFIG__
       tanımlıysa aktif olur: kimlik Google ile Giriş (Firebase Auth), veri
       Firestore'da "households/{id}" dokümanında saklanır, gerçek zamanlı
-      (onSnapshot) senkronize olur, davet sistemiyle aile üyeleri eklenir. */
+      (onSnapshot) senkronize olur, davet sistemiyle aile üyeleri eklenir.
+   3) Kendi sunucu ("selfhosted", 10 Eylül 2026'da eklendi) — window.__SELFHOSTED__
+      tanımlıysa aktif olur: Firebase'e HİÇ bağımlı değil. Kimlik yine Google
+      ile Giriş ama doğrudan Google'ın kendi OAuth 2.0 servisiyle (server/
+      klasöründeki küçük Node/Express backend üzerinden); veri de Firestore
+      yerine bu backend'in tuttuğu düz JSON dosyalarında saklanır. Firebase ve
+      selfhosted modları, kullanıcıya aynı deneyimi (Google ile Giriş, aile
+      üyeleri arasında paylaşılan veri, davet, otomatik yedekleme) sunar; bu
+      yüzden aşağıda ikisini de kapsayan bir HAS_REAL_AUTH bayrağı kullanılıyor
+      ve "fb*" adlı fonksiyonlar (isimleri tarihsel nedenlerle korunuyor)
+      içeride BACKEND'e göre Firestore SDK'sı ile mi yoksa /api/... çağrılarıyla
+      mı konuşacaklarına karar veriyor. */
 (function(){
   "use strict";
 
   /* Hangi barındırma ortamında çalıştığımızı en başta belirliyoruz; state
      yükleme, kimlik ve kaydetme mantığının tamamı buna göre dallanır. */
-  var BACKEND = (typeof window !== 'undefined' && window.__FIREBASE_CONFIG__) ? 'firebase' : 'artifact';
+  var BACKEND = (typeof window !== 'undefined' && window.__FIREBASE_CONFIG__) ? 'firebase' :
+    (typeof window !== 'undefined' && window.__SELFHOSTED__) ? 'selfhosted' : 'artifact';
+  /* Firebase ve selfhosted, "gerçek Google kimlik doğrulaması + aile üyeleri
+     arasında paylaşılan sunucu tarafı veri" anlamında birbirinin aynısı
+     davranır; UI kodunun çoğu bu ikisini ayırt etmeye gerek duymaz. */
+  var HAS_REAL_AUTH = (BACKEND === 'firebase' || BACKEND === 'selfhosted');
 
   /* ---------------- ikonlar ---------------- */
   var ICONS = {
@@ -837,7 +853,7 @@
      tamamlanana kadar null kalır (bkz. fbResolveHousehold); o ana kadar
      renderApp() giriş/yükleniyor ekranlarını gösterir. */
   var state;
-  if(BACKEND === 'firebase'){
+  if(HAS_REAL_AUTH){
     state = null;
   } else {
     try{
@@ -993,9 +1009,93 @@
       fbError = 'Firebase başlatılamadı: ' + (e && e.message ? e.message : String(e));
       fbBooting = false;
     }
+  } else if(BACKEND === 'selfhosted'){
+    shBoot();
+  }
+
+  /* ---------------- kendi sunucu (selfhosted) — Firebase'siz eşdeğer ----------------
+     Kimlik ve veri artık Firestore SDK'sı üzerinden değil, server/server.js'in
+     sunduğu küçük REST API'siyle (/api/...) konuşuluyor. Firestore'un
+     onSnapshot() ile anlık bildirdiği değişiklikler burada basit bir periyodik
+     "GET /api/state" yoklamasıyla (polling) taklit ediliyor — küçük bir hane
+     defteri (birkaç kişi) için fazlasıyla yeterli, WebSocket gibi ekstra bir
+     altyapı gerektirmiyor. fbUser/fbBooting/fbError değişkenleri Firebase'le
+     BİREBİR AYNI şekilde dolduruluyor ki geri kalan tüm arayüz kodu (topbar,
+     Ayarlar, giriş ekranları) hangi backend olduğunu bilmeden çalışabilsin. */
+  var shPollTimer = null;
+  var shLastKnownUpdatedAt = null;
+  var shSaving = false; /* kendi POST'umuz sürerken poll'un aynı anda state'i değiştirmesini önler */
+
+  function shBoot(){
+    fetch('/api/me', { credentials:'same-origin' }).then(function(r){ return r.json(); }).then(function(me){
+      if(!me.loggedIn){ fbUser = null; fbBooting = false; render(); return; }
+      fbUser = { uid: me.user.uid, email: me.user.email, displayName: me.user.name, photoURL: me.user.photoURL };
+      return fetch('/api/state', { credentials:'same-origin' }).then(function(r2){
+        if(r2.status === 401){ fbUser = null; fbBooting = false; render(); return; }
+        if(!r2.ok) throw new Error('HTTP ' + r2.status);
+        return r2.json().then(function(data){
+          state = migrateState(data.state || defaultState());
+          if(!state.people.some(function(p){ return p.id === fbUser.uid; })){
+            state.people.push({ id: fbUser.uid, name: fbUser.displayName || fbUser.email, approved: true, isAdmin: false });
+          }
+          localIdentity = fbUser.uid;
+          shLastKnownUpdatedAt = data.updatedAt;
+          fbBooting = false;
+          render();
+          shStartPolling();
+        });
+      });
+    }).catch(function(err){
+      fbError = (err && err.message) || 'Sunucuya bağlanılamadı.';
+      fbBooting = false;
+      render();
+    });
+  }
+
+  function shStartPolling(){
+    if(shPollTimer) return;
+    shPollTimer = setInterval(function(){
+      if(shSaving || document.hidden) return;
+      fetch('/api/state', { credentials:'same-origin' }).then(function(r){
+        if(r.status === 401){
+          clearInterval(shPollTimer); shPollTimer = null;
+          fbUser = null; state = null; render();
+          return;
+        }
+        if(!r.ok) return;
+        return r.json().then(function(data){
+          if(data.updatedAt === shLastKnownUpdatedAt) return;
+          shLastKnownUpdatedAt = data.updatedAt;
+          state = migrateState(data.state || defaultState());
+          render();
+        });
+      }).catch(function(){ /* geçici ağ hatası — bir sonraki yoklamada tekrar denenir */ });
+    }, 5000);
+  }
+
+  /* persist()'in selfhosted dalı bunu çağırır (bkz. aşağıdaki persist()). */
+  function shPersist(){
+    if(!state) return;
+    shSaving = true;
+    fetch('/api/state', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state: state })
+    }).then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function(data){
+      shLastKnownUpdatedAt = data.updatedAt;
+      shSaving = false;
+    }).catch(function(err){
+      shSaving = false;
+      showToast('Kaydedilemedi: ' + (err && err.message ? err.message : 'bilinmeyen hata'));
+    });
   }
 
   function fbSignIn(){
+    if(BACKEND === 'selfhosted'){ window.location.href = '/api/auth/google/start'; return; }
     if(!fbAuth){ return; }
     fbAuth.signInWithPopup(new firebase.auth.GoogleAuthProvider()).catch(function(err){
       /* açılır pencere engellenmişse yönlendirmeyle dene */
@@ -1008,16 +1108,35 @@
     });
   }
   function fbSignOut(){
+    if(BACKEND === 'selfhosted'){
+      if(shPollTimer){ clearInterval(shPollTimer); shPollTimer = null; }
+      fetch('/api/auth/logout', { method:'POST', credentials:'same-origin' })
+        .catch(function(){})
+        .then(function(){ window.location.reload(); });
+      return;
+    }
     if(!fbAuth) return;
     if(fbUnsub){ fbUnsub(); fbUnsub = null; }
     fbAuth.signOut();
   }
   /* Ayarlar'daki "Davet Et" formu bunu çağırır: household id'sini invites/{email}
      altına yazar; o e-postayla ilk kez Google girişi yapan kişi bunu bulup
-     aynı household'a katılır (bkz. fbResolveHousehold). */
+     aynı household'a katılır (bkz. fbResolveHousehold / server.js'teki resolveHousehold). */
   function fbInvite(email){
     email = (email || '').trim().toLowerCase();
-    if(!email || !fbHouseholdId || !fbDb) return Promise.reject(new Error('geçersiz e-posta'));
+    if(!email) return Promise.reject(new Error('geçersiz e-posta'));
+    if(BACKEND === 'selfhosted'){
+      return fetch('/api/invite', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email })
+      }).then(function(r){
+        if(!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+    }
+    if(!fbHouseholdId || !fbDb) return Promise.reject(new Error('geçersiz e-posta'));
     return fbDb.collection('invites').doc(email).set({
       householdId: fbHouseholdId,
       invitedByUid: fbUser.uid,
@@ -1055,6 +1174,18 @@
   }
   /* Ayarlar > Veri > Yedekler'de "Yedekleri Görüntüle"ye basınca çağrılır. */
   function fbListBackups(){
+    if(BACKEND === 'selfhosted'){
+      ui.backupsList = 'loading';
+      render();
+      fetch('/api/backups', { credentials:'same-origin' }).then(function(r){ return r.json(); }).then(function(data){
+        ui.backupsList = data.backups || [];
+        render();
+      }).catch(function(err){
+        ui.backupsList = [];
+        showToast('Yedek listesi alınamadı: ' + (err && err.message ? err.message : 'bilinmeyen hata'));
+      });
+      return;
+    }
     if(!fbHouseholdRef) return;
     ui.backupsList = 'loading';
     render();
@@ -1069,6 +1200,20 @@
     });
   }
   function fbRestoreBackup(backupId){
+    if(BACKEND === 'selfhosted'){
+      fetch('/api/backups/' + encodeURIComponent(backupId), { credentials:'same-origin' }).then(function(r){
+        if(!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      }).then(function(data){
+        state = migrateState(data.state || defaultState());
+        logAudit('backup-restore', backupId + ' tarihli yedek geri yüklendi');
+        persist();
+        showToast(backupId + ' tarihli yedek geri yüklendi.');
+      }).catch(function(err){
+        showToast('Yedek geri yüklenemedi: ' + (err && err.message ? err.message : 'bilinmeyen hata'));
+      });
+      return;
+    }
     if(!fbHouseholdRef) return;
     fbHouseholdRef.collection('backups').doc(backupId).get().then(function(doc){
       if(!doc.exists){ showToast('Yedek bulunamadı.'); return; }
@@ -1806,7 +1951,7 @@
   }
 
   function renderApp(){
-    if(BACKEND === 'firebase'){
+    if(HAS_REAL_AUTH){
       if(!fbUser) return renderGoogleSignInScreen();
       if(fbBooting || !state) return renderFbLoadingScreen();
     } else {
@@ -2835,7 +2980,7 @@
      sitede anlamlıdır (docs/rates.json yalnızca orada, sayfayla aynı yerde
      durur); Claude Artifact sürümünde bilgilendirici bir mesaj gösterilir. */
   function fetchFinRates(){
-    if(BACKEND!=='firebase') return;
+    if(!HAS_REAL_AUTH) return;
     ui.finRatesLoading = true;
     ui.finRatesError = null;
     render();
@@ -2855,7 +3000,7 @@
 
   function renderFinansalBilgi(){
     var html = '<div class="section-title">Güncel Kur ve Altın Bilgisi</div>';
-    if(BACKEND!=='firebase'){
+    if(!HAS_REAL_AUTH){
       html += '<div class="card"><p class="mute2">Bu bilgi yalnızca bağımsız site sürümünde kullanılabilir; otomatik günlük güncelleme GitHub üzerinde çalışır ve bu Claude Artifact görünümüne dahil değildir.</p></div>';
       return html;
     }
@@ -2976,11 +3121,11 @@
 
     html += '<div class="section-title">Bu Cihaz</div><div class="card">';
     html += '<div class="switch-row"><span>Giriş yapan: ' + esc(me ? me.name : '—') +
-      (BACKEND==='firebase' && fbUser && fbUser.email ? ' <span class="mute2">(' + esc(fbUser.email) + ')</span>' : '') + '</span>' +
-      '<button class="btn btn-ghost btn-sm" data-action="identity-logout">' + (BACKEND==='firebase' ? 'Çıkış Yap' : 'Kullanıcı Değiştir') + '</button></div>';
+      (HAS_REAL_AUTH && fbUser && fbUser.email ? ' <span class="mute2">(' + esc(fbUser.email) + ')</span>' : '') + '</span>' +
+      '<button class="btn btn-ghost btn-sm" data-action="identity-logout">' + (HAS_REAL_AUTH ? 'Çıkış Yap' : 'Kullanıcı Değiştir') + '</button></div>';
     html += '</div>';
 
-    if(BACKEND === 'firebase'){
+    if(HAS_REAL_AUTH){
       html += renderFbHouseholdSection();
     } else {
       var pending = state.people.filter(function(p){ return !p.approved; });
@@ -3059,7 +3204,7 @@
     html += renderShareShortcutCard();
 
     html += '<div class="section-title">Veri</div><div class="card">';
-    if(BACKEND==='firebase' && state.accounts.length<=1 && !state.transactions.length){
+    if(HAS_REAL_AUTH && state.accounts.length<=1 && !state.transactions.length){
       html += '<div class="stack"><span>Eski sistemden veri içe aktar</span>' +
         '<span class="mute2">Claude Artifact sürümündeki Ayarlar > "Tüm veriyi yedekle" ile indirdiğiniz JSON dosyasını açıp içeriğini aşağıya yapıştırın.</span></div>' +
         '<form data-action="fb-restore-import" style="margin-top:8px;display:flex;flex-direction:column;gap:8px">' +
@@ -3086,13 +3231,13 @@
     html += '<div class="row" style="margin-top:10px"><div class="stack"><span>Tüm veriyi yedekle</span><span class="mute2">JSON — tüm hesap/hareket/ayarları içerir</span></div>' +
       '<button class="btn btn-sm" data-action="export-json">' + icon('download') + ' JSON İndir</button></div>';
     html += '<p class="mute2" style="margin-top:8px">Not: Bu platformda gerçek bir .xlsx (Excel ikili) dosyası üretilemiyor; CSV dosyası Excel\'de doğrudan açılır ve aynı işi görür.</p>';
-    if(BACKEND==='firebase') html += renderBackupsSubsection();
+    if(HAS_REAL_AUTH) html += renderBackupsSubsection();
     html += '</div>';
 
     html += renderAuditLogSection();
 
     html += '<p class="mute2" style="margin-top:18px;text-align:center">' +
-      (BACKEND==='firebase' ? 'Hane defterinizdeki tüm üyeler aynı veriyi gerçek zamanlı paylaşır.' : 'Bu sayfa yayınlandığı andan itibaren tüm görüntüleyenler aynı veriyi paylaşır.') +
+      (HAS_REAL_AUTH ? 'Hane defterinizdeki tüm üyeler aynı veriyi gerçek zamanlı paylaşır.' : 'Bu sayfa yayınlandığı andan itibaren tüm görüntüleyenler aynı veriyi paylaşır.') +
       '</p>';
     return html;
   }
@@ -3217,7 +3362,7 @@
     var filename, data, mime;
     if(kind==='csv'){ filename = 'hane-defteri-hareketler-' + todayISO() + '.csv'; data = transactionsToCSV(); mime = 'text/csv;charset=utf-8'; }
     else { filename = 'hane-defteri-yedek-' + todayISO() + '.json'; data = fullBackupJSON(); mime = 'application/json;charset=utf-8'; }
-    if(BACKEND === 'firebase'){
+    if(HAS_REAL_AUTH){
       if(downloadViaBlob(filename, data, mime)){
         showToast('İndirildi: ' + filename);
         logAudit('export', (kind==='csv'?'Hareketler CSV olarak':'Tüm veri JSON olarak') + ' dışa aktarıldı');
@@ -4033,6 +4178,10 @@
       });
       return;
     }
+    if(BACKEND === 'selfhosted'){
+      shPersist();
+      return;
+    }
     if(!artifactReady){ return; }
     if(!artifactApi){
       if(!ui._noPersistWarned){ ui._noPersistWarned = true; showToast('Bu görünümde kalıcı kayıt kullanılamıyor; değişiklikler yalnızca bu oturumda tutulacak.'); }
@@ -4095,7 +4244,7 @@
 
     if(action==='tab'){
       ui.tab = el.getAttribute('data-tab');
-      if(ui.tab==='bilgi' && BACKEND==='firebase' && !ui.finRates && !ui.finRatesLoading && !ui.finRatesError){ fetchFinRates(); return; }
+      if(ui.tab==='bilgi' && HAS_REAL_AUTH && !ui.finRates && !ui.finRatesLoading && !ui.finRatesError){ fetchFinRates(); return; }
       render(); return;
     }
     if(action==='finrates-refresh'){ fetchFinRates(); return; }
@@ -4123,7 +4272,7 @@
     if(action==='identity-request-toggle'){ ui.identityRequesting = true; render(); return; }
     if(action==='identity-request-cancel'){ ui.identityRequesting = false; render(); return; }
     if(action==='identity-logout'){
-      if(BACKEND === 'firebase'){ fbSignOut(); return; }
+      if(HAS_REAL_AUTH){ fbSignOut(); return; }
       clearLocalIdentity();
       localIdentity = null;
       ui.identityRequesting = false;
