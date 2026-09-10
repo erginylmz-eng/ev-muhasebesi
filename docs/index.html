@@ -117,6 +117,7 @@
   }
   .topbar .brand{ font-size:1.25rem; letter-spacing:-0.01em; }
   .topbar .brand small{ display:block; font-family:"IBM Plex Sans"; font-weight:400; font-size:0.72rem; color:var(--ink-mute); letter-spacing:0.04em; text-transform:uppercase; margin-top:2px;}
+  .topbar-right{ display:flex; align-items:center; gap:8px; }
   .readonly-chip{ font-size:0.68rem; text-transform:uppercase; letter-spacing:0.06em; background:var(--warning-soft); color:var(--warning); padding:4px 9px; border-radius:20px; font-weight:600; }
 
   /* giriş perdesi */
@@ -2040,7 +2041,10 @@
     var titles = { ozet:'Özet', hareketler:'Hareketler', hesaplar:'Hesaplar', raporlar:'Raporlar', bilgi:'Finansal Bilgilendirme', sifreler:'Şifreler', ayarlar:'Ayarlar' };
     return '<div class="topbar">' +
       '<div class="brand">Hane Defteri<small>' + esc(titles[ui.tab]||'') + '</small></div>' +
-      (ui.readOnly ? '<span class="readonly-chip">Salt okunur</span>' : '') +
+      '<div class="topbar-right">' +
+        '<a class="btn btn-ghost btn-sm" href="https://wonsideas.com" target="_blank" rel="noopener noreferrer">' + icon('ext') + ' wonsideas.com</a>' +
+        (ui.readOnly ? '<span class="readonly-chip">Salt okunur</span>' : '') +
+      '</div>' +
       '</div>';
   }
 

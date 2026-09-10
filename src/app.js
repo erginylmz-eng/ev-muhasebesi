@@ -1656,7 +1656,10 @@
     var titles = { ozet:'Özet', hareketler:'Hareketler', hesaplar:'Hesaplar', raporlar:'Raporlar', bilgi:'Finansal Bilgilendirme', sifreler:'Şifreler', ayarlar:'Ayarlar' };
     return '<div class="topbar">' +
       '<div class="brand">Hane Defteri<small>' + esc(titles[ui.tab]||'') + '</small></div>' +
-      (ui.readOnly ? '<span class="readonly-chip">Salt okunur</span>' : '') +
+      '<div class="topbar-right">' +
+        '<a class="btn btn-ghost btn-sm" href="https://wonsideas.com" target="_blank" rel="noopener noreferrer">' + icon('ext') + ' wonsideas.com</a>' +
+        (ui.readOnly ? '<span class="readonly-chip">Salt okunur</span>' : '') +
+      '</div>' +
       '</div>';
   }
 
