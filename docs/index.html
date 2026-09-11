@@ -1724,6 +1724,93 @@
     return out;
   }
 
+  /* ---------------- Gelecek Ödemeler (Raporlar) ----------------
+     Kullanıcı isteği: hangi gün ne kadar ödemesi olduğunu tek bir kronolojik
+     tabloda, kümülatif bir bakiyeyle birlikte görebilmek (Excel'de tuttuğu
+     tabloya benzer). Dört kaynaktan besleniyor: (1) planlı [gelecek tarihli,
+     henüz gerçekleşmemiş] kayıtlar, (2) düzenli ödemelerin önümüzdeki
+     aylara projekte edilen tarihleri, (3) kredi kartlarının hesaplanmış
+     ödeme günleri (güncel borç tutarıyla), (4) kredi hesaplarının henüz
+     ödenmemiş taksitleri (amortisman tablosundan).
+     Başlangıç bakiyesi kasıtlı olarak cashLikeTotal() (nakit + banka +
+     harici ödeme araçları + verilen borç) — kredi kartı/kredi hesaplarının
+     KENDİ güncel borcu başlangıca dahil edilmiyor, çünkü bu borçların
+     ödemeleri zaten aşağıda ayrı satırlar olarak vadesi geldikçe düşülüyor;
+     ikisi birden sayılırsa bakiye gerçekte olduğundan daha düşük görünür. */
+  function upcomingPaymentsRows(monthsAhead){
+    monthsAhead = monthsAhead || 3;
+    var today = todayISO();
+    var horizon = addMonthsToDate(today, monthsAhead);
+    var startMk = currentMonthKey();
+    var rows = [];
+
+    /* 1) Planlı kayıtlar (gelir/gider/transfer) */
+    state.transactions.filter(function(t){ return isPlanned(t) && t.date<=horizon; }).forEach(function(t){
+      if(t.type==='transfer'){
+        var toAcct = getAccount(t.toAccountId);
+        if(toAcct && isDebtType(toAcct.type)){
+          rows.push({ date:t.date, kind:'expense', amount:t.amount, title:toAcct.name + ' ödemesi', source:'Planlı' });
+        }
+        return;
+      }
+      var info = txCategoryInfo(t);
+      var acct = getAccount(t.accountId);
+      rows.push({ date:t.date, kind:t.type, amount:t.amount, title: info.name + (t.note?(' · '+t.note):'') + (acct?(' · '+acct.name):''), source:'Planlı' });
+    });
+
+    /* 2) Düzenli ödemeler — henüz bu ay için gerçek kayıt oluşmamış olanlar,
+       aktif kaldığı sürece (taksit sayısı varsa onunla sınırlı) önümüzdeki
+       aylara projekte edilir. */
+    state.recurring.filter(function(r){ return r.active; }).forEach(function(r){
+      var maxOcc = monthsAhead + 1;
+      if(r.totalInstallments!=null && r.installmentsRemaining!=null) maxOcc = Math.min(maxOcc, r.installmentsRemaining);
+      for(var i=0;i<maxOcc;i++){
+        var mk = addMonths(startMk, i);
+        if((r.skippedMonths||[]).indexOf(mk)!==-1) continue;
+        var d = mk + '-' + pad2(clamp(r.day,1,28));
+        if(d<today || d>horizon) continue;
+        if(state.transactions.some(function(t){ return t.id===recurringGenId(r, mk); })) continue;
+        var acct2 = getAccount(r.accountId);
+        rows.push({ date:d, kind:r.type, amount:r.amount, title:r.name + ' (Düzenli' + (r.isSubscription?' · abonelik':'') + ')' + (acct2?(' · '+acct2.name):''), source:'Düzenli Ödeme' });
+      }
+    });
+
+    /* 3) Kredi kartı ödeme günleri — önümüzdeki her dönem için hesaplanan
+       ödeme tarihi, o dönemin güncel bilinen borcuyla (basitleştirme: gelecek
+       dönemlerin henüz oluşmamış harcamaları hesaba katılmıyor, yalnızca şu
+       anki toplam borç kullanılıyor). */
+    state.accounts.filter(function(a){ return a.type==='card' && a.statementDay && a.paymentDay; }).forEach(function(a){
+      var bal = accountBalance(a.id);
+      if(bal<=0) return;
+      for(var i=0;i<=monthsAhead;i++){
+        var mk2 = addMonths(startMk, i);
+        var payDate = cardPaymentDateForStatement(a, mk2);
+        if(payDate<today || payDate>horizon) continue;
+        rows.push({ date:payDate, kind:'expense', amount:bal, title:a.name + ' ödemesi (kart borcu)', source:'Kredi Kartı' });
+        break; /* aynı borç, ilk denk gelen ödeme gününde bir kez gösterilir */
+      }
+    });
+
+    /* 4) Kredi taksitleri — amortisman tablosundaki henüz ödenmemiş satırlar */
+    state.accounts.filter(function(a){ return a.type==='loan_account' && a.schedule && a.schedule.length; }).forEach(function(a){
+      var paidCount = loanPaidCount(a);
+      a.schedule.forEach(function(r, idx){
+        if(idx<paidCount) return;
+        if(r.date<today || r.date>horizon) return;
+        rows.push({ date:r.date, kind:'expense', amount:r.payment, title:a.name + ' taksidi (#' + r.no + ')', source:'Kredi Taksiti' });
+      });
+    });
+
+    rows.sort(function(a,b){ return a.date<b.date?-1:(a.date>b.date?1:0); });
+
+    var balance = cashLikeTotal();
+    rows.forEach(function(row){
+      balance += (row.kind==='income' ? row.amount : -row.amount);
+      row.runningBalance = balance;
+    });
+    return rows;
+  }
+
   /* Kişiye göre harcama: gerçekleşen tutarların yanında, henüz gerçekleşmemiş
      (planlı/gelecek tarihli) tutarları da ayrı alanlarda döner — Raporlar'daki
      kişi çubuklarında planlı kısım, kategori dağılımındakiyle aynı desende
@@ -2787,6 +2874,7 @@
     }
     html += '</div>';
 
+    html += renderUpcomingPaymentsSection(mk);
     html += renderInsightsSection(mk);
     html += renderSubscriptionsCard();
 
@@ -2875,6 +2963,38 @@
     html += '<div class="section-title">Hesap Bakiyeleri</div>';
     html += renderAssetBreakdownCard();
 
+    return html;
+  }
+
+  /* Gelecek Ödemeler tablosu: her satırda tarih, işlem, tutar (gelir/gider)
+     ve o satıra kadar kümülatif tahmini bakiye. Yalnızca Raporlar geçerli ay
+     seçiliyken gösterilir (geçmiş/başka aylarda "gelecek" kavramı anlamsız). */
+  function renderUpcomingPaymentsSection(mk){
+    if(mk !== currentMonthKey()) return '';
+    var rows = upcomingPaymentsRows(3);
+    var html = '<div class="section-title">Gelecek Ödemeler (önümüzdeki 3 ay)</div><div class="card">';
+    html += '<p class="mute2" style="padding:10px 14px 0">Planlı kayıtlar, düzenli ödemeler, kredi kartı ödeme günleri ve kredi taksitleri tek bir kronolojik listede. Başlangıç bakiyesi: nakit + banka + ödeme araçları toplamınız (' + fmtTRY(cashLikeTotal()) + ') — kredi kartı/kredi borcunuzun kendisi buna dahil değil, ödemeleri vadesi geldikçe aşağıda ayrı satır olarak düşülüyor (çifte sayılmasın diye).</p>';
+    if(!rows.length){
+      html += renderEmpty('Önümüzdeki 3 ay için planlı/düzenli bir ödeme veya kredi/kart vadesi görünmüyor.');
+    } else {
+      html += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.82rem;margin-top:6px">';
+      html += '<thead><tr style="position:sticky;top:0;background:var(--surface)">' +
+        '<th style="padding:6px 8px;text-align:left">Tarih</th><th style="padding:6px 8px;text-align:left">Açıklama</th>' +
+        '<th style="padding:6px 8px;text-align:left">Kaynak</th><th style="padding:6px 8px;text-align:right">Tutar</th>' +
+        '<th style="padding:6px 8px;text-align:right">Tahmini Bakiye</th></tr></thead><tbody>';
+      rows.forEach(function(r){
+        var neg = r.runningBalance < 0;
+        html += '<tr>' +
+          '<td style="padding:6px 8px;white-space:nowrap">' + fmtDate(r.date) + '</td>' +
+          '<td style="padding:6px 8px">' + esc(r.title) + '</td>' +
+          '<td style="padding:6px 8px"><span class="mute2">' + esc(r.source) + '</span></td>' +
+          '<td style="padding:6px 8px;text-align:right;color:' + (r.kind==='income'?'var(--income)':'var(--expense)') + '" class="num">' + (r.kind==='income'?'+':'−') + fmtTRY(r.amount) + '</td>' +
+          '<td style="padding:6px 8px;text-align:right' + (neg ? ';color:var(--expense)' : '') + '" class="num">' + fmtTRY(r.runningBalance) + '</td>' +
+          '</tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+    html += '</div>';
     return html;
   }
 
